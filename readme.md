@@ -1,6 +1,7 @@
 # Parser
 
-This module turns Jai source text into a syntax tree.
+This module turns Jai source text into a syntax tree and can run a lightweight
+semantic analysis pass over that tree.
 
 It does the job in two stages. First, the lexer reads the raw source string and
 produces a flat stream of tokens. Tokens keep their original text and source
@@ -14,11 +15,18 @@ climbing parser so operators bind in the expected order. Postfix expression
 forms such as calls, field access, indexing, and aggregate literals are parsed
 after primary expressions.
 
+Third, the semantic pass walks the AST and builds declaration tables for
+structs and functions. It also resolves local variables and expression types
+when the current subset has enough information. Expression types are stored in a
+side table keyed by AST node pointer, so the AST remains purely syntactic.
+
 The public entry points are:
 
 - `lex(input)` for tokenization only.
 - `parse(input)` for lexing and parsing in one call.
 - `parse_tokens(tokens)` for parsing an existing token stream.
+- `analyze(root)` for semantic analysis of an AST root.
+- `analyze_source(input)` for lexing, parsing, and semantic analysis in one call.
 
 Each entry point returns a result struct with `success`, payload data, and an
 error field. The parser stops at the first error for now.
@@ -36,4 +44,4 @@ The parser is not a complete Jai parser yet. Important missing areas include:
 - full type syntax such as arrays, slices, procedure types, and type literals
 - operators beyond the small arithmetic/assignment set currently tokenized
 - comments other than `//` line comments
-- semantic analysis, name resolution, and type checking
+- full semantic analysis, full name resolution, and complete type checking
