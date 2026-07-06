@@ -122,6 +122,7 @@ next_token :: (lexer: *Lexer) -> Token {
 
     if is_identifier_start(c) return consume_identifier_or_keyword_token(lexer);
     if is_digit(c) return consume_number_token(lexer);
+    if c == #char "." && is_digit(peek_at(lexer, 1)) return consume_number_token(lexer);
     if c == #char "\"" return consume_string_token(lexer);
 
     if c == #char "(" return consume_one_character_token(lexer, .OPEN_PAREN);
@@ -132,11 +133,71 @@ next_token :: (lexer: *Lexer) -> Token {
     if c == #char "]" return consume_one_character_token(lexer, .CLOSE_BRACKET);
     if c == #char ";" return consume_one_character_token(lexer, .SEMICOLON);
     if c == #char "," return consume_one_character_token(lexer, .COMMA);
-    if c == #char "." return consume_one_character_token(lexer, .DOT);
+    if c == #char "." {
+        if peek_at(lexer, 1) == #char "." return consume_two_character_token(lexer, .DOT_DOT);
+        return consume_one_character_token(lexer, .DOT);
+    }
     if c == #char "$" return consume_one_character_token(lexer, .DOLLAR);
-    if c == #char "*" return consume_one_character_token(lexer, .STAR);
-    if c == #char "/" return consume_one_character_token(lexer, .SLASH);
-    if c == #char "=" return consume_one_character_token(lexer, .EQUAL);
+    if c == #char "#" {
+        if starts_with_at_current_position(lexer, "#string") return consume_raw_string_token(lexer);
+        return consume_one_character_token(lexer, .HASH);
+    }
+    if c == #char "`" return consume_one_character_token(lexer, .BACKTICK);
+    if c == #char "@" return consume_one_character_token(lexer, .AT);
+    if c == #char "*" {
+        if peek_at(lexer, 1) == #char "=" return consume_two_character_token(lexer, .STAR_EQUAL);
+        return consume_one_character_token(lexer, .STAR);
+    }
+    if c == #char "/" {
+        if peek_at(lexer, 1) == #char "=" return consume_two_character_token(lexer, .SLASH_EQUAL);
+        return consume_one_character_token(lexer, .SLASH);
+    }
+    if c == #char "%" {
+        if peek_at(lexer, 1) == #char "=" return consume_two_character_token(lexer, .PERCENT_EQUAL);
+        return consume_one_character_token(lexer, .PERCENT);
+    }
+    if c == #char "&" {
+        if peek_at(lexer, 1) == #char "&" return consume_two_character_token(lexer, .AND_AND);
+        if peek_at(lexer, 1) == #char "=" return consume_two_character_token(lexer, .AMPERSAND_EQUAL);
+        return consume_one_character_token(lexer, .AMPERSAND);
+    }
+
+    if c == #char "^" {
+        if peek_at(lexer, 1) == #char "=" return consume_two_character_token(lexer, .CARET_EQUAL);
+        return consume_one_character_token(lexer, .CARET);
+    }
+
+    if c == #char "|" {
+        if peek_at(lexer, 1) == #char "|" return consume_two_character_token(lexer, .OR_OR);
+        if peek_at(lexer, 1) == #char "=" return consume_two_character_token(lexer, .PIPE_EQUAL);
+        return consume_one_character_token(lexer, .PIPE);
+    }
+    if c == #char "~" return consume_one_character_token(lexer, .TILDE);
+
+    if c == #char "=" {
+        if peek_at(lexer, 1) == #char ">" return consume_two_character_token(lexer, .FAT_ARROW);
+        if peek_at(lexer, 1) == #char "=" return consume_two_character_token(lexer, .EQUAL_EQUAL);
+        return consume_one_character_token(lexer, .EQUAL);
+    }
+
+    if c == #char "!" {
+        if peek_at(lexer, 1) == #char "=" return consume_two_character_token(lexer, .BANG_EQUAL);
+        return consume_one_character_token(lexer, .BANG);
+    }
+
+    if c == #char "<" {
+        if peek_at(lexer, 1) == #char "<" && peek_at(lexer, 2) == #char "=" return consume_three_character_token(lexer, .LESS_LESS_EQUAL);
+        if peek_at(lexer, 1) == #char "<" return consume_two_character_token(lexer, .LESS_LESS);
+        if peek_at(lexer, 1) == #char "=" return consume_two_character_token(lexer, .LESS_EQUAL);
+        return consume_one_character_token(lexer, .LESS);
+    }
+
+    if c == #char ">" {
+        if peek_at(lexer, 1) == #char ">" && peek_at(lexer, 2) == #char "=" return consume_three_character_token(lexer, .GREATER_GREATER_EQUAL);
+        if peek_at(lexer, 1) == #char ">" return consume_two_character_token(lexer, .GREATER_GREATER);
+        if peek_at(lexer, 1) == #char "=" return consume_two_character_token(lexer, .GREATER_EQUAL);
+        return consume_one_character_token(lexer, .GREATER);
+    }
 
     if c == #char "+" {
         if peek_at(lexer, 1) == #char "=" return consume_two_character_token(lexer, .PLUS_EQUAL);
@@ -144,6 +205,8 @@ next_token :: (lexer: *Lexer) -> Token {
     }
 
     if c == #char "-" {
+        if peek_at(lexer, 1) == #char "-" && peek_at(lexer, 2) == #char "-" return consume_three_character_token(lexer, .TRIPLE_MINUS);
+        if peek_at(lexer, 1) == #char "=" return consume_two_character_token(lexer, .MINUS_EQUAL);
         if peek_at(lexer, 1) == #char ">" return consume_two_character_token(lexer, .ARROW);
         return consume_one_character_token(lexer, .MINUS);
     }
@@ -177,6 +240,18 @@ skip_whitespace_and_comments :: (lexer: *Lexer) {
             continue;
         }
 
+        if c == #char "/" && peek_at(lexer, 1) == #char "*" {
+            advance_n(lexer, 2);
+            while remaining(lexer) > 0 {
+                if peek(lexer) == #char "*" && peek_at(lexer, 1) == #char "/" {
+                    advance_n(lexer, 2);
+                    break;
+                }
+                advance(lexer);
+            }
+            continue;
+        }
+
         break;
     }
 }
@@ -199,14 +274,31 @@ consume_two_character_token :: (lexer: *Lexer, kind: Token_Kind) -> Token {
     return .{ kind = kind, text = span_text(lexer.source_code, span), span = span };
 }
 
+consume_three_character_token :: (lexer: *Lexer, kind: Token_Kind) -> Token {
+    start_position_in_input := lexer.position;
+    start_line := lexer.line;
+    start_column := lexer.column;
+    advance_n(lexer, 3);
+    span := make_span(start_position_in_input, lexer.position, start_line, start_column);
+    return .{ kind = kind, text = span_text(lexer.source_code, span), span = span };
+}
+
 consume_identifier_or_keyword_token :: (lexer: *Lexer) -> Token {
     start_position_in_input := lexer.position;
     start_line := lexer.line;
     start_column := lexer.column;
 
     advance(lexer);
-    while remaining(lexer) > 0 && is_identifier_continue(peek(lexer))
+    while remaining(lexer) > 0 && (is_identifier_continue(peek(lexer)) || peek(lexer) == #char "\\") {
+        if peek(lexer) == #char "\\" {
+            advance(lexer);
+            while remaining(lexer) > 0 && (peek(lexer) == #char " " || peek(lexer) == #char "\t" || peek(lexer) == #char "\r" || peek(lexer) == #char "\n")
+                advance(lexer);
+            continue;
+        }
+
         advance(lexer);
+    }
 
     span := make_span(start_position_in_input, lexer.position, start_line, start_column);
     text := span_text(lexer.source_code, span);
@@ -214,10 +306,20 @@ consume_identifier_or_keyword_token :: (lexer: *Lexer) -> Token {
 
     if text == "return" kind = .RETURN;
     else if text == "if" kind = .IF;
+    else if text == "ifx" kind = .IFX;
+    else if text == "then" kind = .THEN;
+    else if text == "for" kind = .FOR;
+    else if text == "while" kind = .WHILE;
+    else if text == "defer" kind = .DEFER;
     else if text == "else" kind = .ELSE;
     else if text == "struct" kind = .STRUCT;
+    else if text == "union" kind = .UNION;
+    else if text == "enum" kind = .ENUM;
+    else if text == "enum_flags" kind = .ENUM_FLAGS;
     else if text == "cast" kind = .CAST;
     else if text == "interface" kind = .INTERFACE;
+    else if text == "using" kind = .USING;
+    else if text == "xx" kind = .XX;
 
     return .{ kind = kind, text = text, span = span };
 }
@@ -227,19 +329,41 @@ consume_number_token :: (lexer: *Lexer) -> Token {
     start_line := lexer.line;
     start_column := lexer.column;
 
-    while remaining(lexer) > 0 && is_digit(peek(lexer))
+    if peek(lexer) == #char "0" && (peek_at(lexer, 1) == #char "x" || peek_at(lexer, 1) == #char "X") {
+        advance_n(lexer, 2);
+        while remaining(lexer) > 0 && (is_hex_digit(peek(lexer)) || peek(lexer) == #char "_")
+            advance(lexer);
+
+        span := make_span(start_position_in_input, lexer.position, start_line, start_column);
+        return .{ kind = .INT_LITERAL, text = span_text(lexer.source_code, span), span = span };
+    }
+
+    while remaining(lexer) > 0 && (is_digit(peek(lexer)) || peek(lexer) == #char "_")
         advance(lexer);
 
     kind := Token_Kind.INT_LITERAL;
     if remaining(lexer) > 0 && peek(lexer) == #char "." && is_digit(peek_at(lexer, 1)) {
         kind = .FLOAT_LITERAL;
         advance(lexer);
-        while remaining(lexer) > 0 && is_digit(peek(lexer))
+        while remaining(lexer) > 0 && (is_digit(peek(lexer)) || peek(lexer) == #char "_")
+            advance(lexer);
+    }
+
+    if remaining(lexer) > 0 && (peek(lexer) == #char "e" || peek(lexer) == #char "E") {
+        kind = .FLOAT_LITERAL;
+        advance(lexer);
+        if remaining(lexer) > 0 && (peek(lexer) == #char "+" || peek(lexer) == #char "-")
+            advance(lexer);
+        while remaining(lexer) > 0 && (is_digit(peek(lexer)) || peek(lexer) == #char "_")
             advance(lexer);
     }
 
     span := make_span(start_position_in_input, lexer.position, start_line, start_column);
     return .{ kind = kind, text = span_text(lexer.source_code, span), span = span };
+}
+
+is_hex_digit :: inline (c: u8) -> bool {
+    return is_digit(c) || (c >= #char "a" && c <= #char "f") || (c >= #char "A" && c <= #char "F");
 }
 
 consume_string_token :: (lexer: *Lexer) -> Token {
@@ -265,6 +389,57 @@ consume_string_token :: (lexer: *Lexer) -> Token {
     span := make_span(start_position_in_input, lexer.position, start_line, start_column);
     set_error(lexer, "Unterminated string literal", span);
     return .{ kind = .INVALID, text = span_text(lexer.source_code, span), span = span };
+}
+
+consume_raw_string_token :: (lexer: *Lexer) -> Token {
+    start_position_in_input := lexer.position;
+    start_line := lexer.line;
+    start_column := lexer.column;
+
+    advance_n(lexer, 7); // #string
+
+    while remaining(lexer) > 0 && (peek(lexer) == #char " " || peek(lexer) == #char "\t")
+        advance(lexer);
+
+    delimiter_start := lexer.position;
+    while remaining(lexer) > 0 && is_identifier_continue(peek(lexer))
+        advance(lexer);
+
+    delimiter_span := make_span(delimiter_start, lexer.position, start_line, start_column);
+    delimiter := span_text(lexer.source_code, delimiter_span);
+
+    while remaining(lexer) > 0 && peek(lexer) != #char "\n"
+        advance(lexer);
+    if remaining(lexer) > 0 advance(lexer);
+
+    while remaining(lexer) > 0 {
+        while remaining(lexer) > 0 && (peek(lexer) == #char " " || peek(lexer) == #char "\t")
+            advance(lexer);
+
+        if starts_with_at_current_position(lexer, delimiter) {
+            advance_n(lexer, delimiter.count);
+            span := make_span(start_position_in_input, lexer.position, start_line, start_column);
+            return .{ kind = .STRING_LITERAL, text = span_text(lexer.source_code, span), span = span };
+        }
+
+        while remaining(lexer) > 0 && peek(lexer) != #char "\n"
+            advance(lexer);
+        if remaining(lexer) > 0 advance(lexer);
+    }
+
+    span := make_span(start_position_in_input, lexer.position, start_line, start_column);
+    set_error(lexer, "Unterminated #string literal", span);
+    return .{ kind = .INVALID, text = span_text(lexer.source_code, span), span = span };
+}
+
+starts_with_at_current_position :: (lexer: *Lexer, text: string) -> bool {
+    if remaining(lexer) < text.count return false;
+
+    for i: 0..text.count-1 {
+        if lexer.source_code[lexer.position + i] != text[i] return false;
+    }
+
+    return true;
 }
 
 is_identifier_start :: inline (c: u8) -> bool {

@@ -35,7 +35,7 @@ error field. The parser stops at the first error for now.
 
 The parser is not a complete Jai parser yet. Important missing areas include:
 
-- imports, load directives, and compiler directives like `#run`
+- AST nodes for imports, load directives, and compiler directives like `#run`
 - control flow such as `if`, `for`, `while`, `case`, and `ifx`
 - procedure bodies containing expression statements that are not assignments
 - declarations with attributes, notes, or calling conventions

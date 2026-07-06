@@ -262,6 +262,9 @@ resolve_expression_type :: (state: *Semantic_State, scope: *Function_Scope, expr
         case .STRING_LITERAL_EXPR;
             result = named_type("string");
 
+        case .UNINITIALIZED_EXPR;
+            result = expected_type;
+
         case .FIELD_ACCESS_EXPR;
             lhs_type := resolve_expression_type(state, scope, expression.lhs);
             result = resolve_field_access_type(state, lhs_type, expression.name, expression.span);
@@ -280,6 +283,9 @@ resolve_expression_type :: (state: *Semantic_State, scope: *Function_Scope, expr
         case .CALL_EXPR;
             result = resolve_call_type(state, scope, expression);
 
+        case .NAMED_ARGUMENT_EXPR;
+            result = resolve_expression_type(state, scope, expression.rhs, expected_type);
+
         case .STRUCT_LITERAL_EXPR;
             if expression.type_node != null {
                 result = resolve_struct_literal_type(state, scope, expression.type_node);
@@ -293,9 +299,29 @@ resolve_expression_type :: (state: *Semantic_State, scope: *Function_Scope, expr
                 resolve_expression_type(state, scope, entry.rhs);
             }
 
+        case .ARRAY_LITERAL_EXPR;
+            if !is_unknown_type(expected_type) {
+                result = expected_type;
+            } else {
+                result = unknown_type();
+            }
+
+            for element : expression.args {
+                resolve_expression_type(state, scope, element);
+            }
+
         case .CAST_EXPR;
             result = resolve_type_node(expression.type_node);
             resolve_expression_type(state, scope, expression.rhs);
+
+        case .EXPRESSION_LIST;
+            result = unknown_type();
+            for element : expression.args {
+                resolve_expression_type(state, scope, element);
+            }
+
+        case .LAMBDA_EXPR;
+            result = unknown_type();
 
         case .UNARY_EXPR;
             result = resolve_expression_type(state, scope, expression.rhs, expected_type);
@@ -404,6 +430,15 @@ resolve_type_node :: (type_node: *Node) -> Resolved_Type {
 
         case .INTERFACE_TYPE;
             return resolve_type_node(type_node.type_node);
+
+        case .TYPE_LIST;
+            return unknown_type();
+
+        case .FUNCTION_TYPE;
+            return unknown_type();
+
+        case .VARIADIC_TYPE;
+            return unknown_type();
     }
 
     return unknown_type();
