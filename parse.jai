@@ -141,6 +141,20 @@ parse_param :: (ps: *Parse_State) -> *Node {
 }
 
 parse_type :: (ps: *Parse_State) -> *Node {
+    if match(ps, .OPEN_BRACKET) {
+        open := previous(ps);
+        node := new_node(.ARRAY_TYPE, open.span);
+
+        if match(ps, .DOT) {
+            expect(ps, .DOT, "Expected second '.' in slice type");
+        } else if !check(ps, .CLOSE_BRACKET) {
+            node.rhs = parse_expression(ps);
+        }
+        expect(ps, .CLOSE_BRACKET, "Expected ']' after array count");
+        node.type_node = parse_type(ps);
+        return node;
+    }
+
     if match(ps, .STAR) {
         star := previous(ps);
         node := new_node(.POINTER_TYPE, star.span);

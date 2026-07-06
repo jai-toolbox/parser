@@ -70,6 +70,7 @@ Node_Kind :: enum {
     CONST_DECL;
     TYPE_NAME;
     POINTER_TYPE;
+    ARRAY_TYPE;
     POLYMORPHIC_TYPE;
     INTERFACE_TYPE;
     BLOCK;

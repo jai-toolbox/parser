@@ -21,12 +21,14 @@ Resolved_Type_Kind :: enum {
     UNKNOWN;
     NAMED;
     POINTER;
+    ARRAY;
 }
 
 Resolved_Type :: struct {
     kind : Resolved_Type_Kind;
     name : string;
     pointee : *Resolved_Type;
+    array_count : int;
 }
 
 Semantic_Field :: struct {
@@ -269,6 +271,8 @@ resolve_expression_type :: (state: *Semantic_State, scope: *Function_Scope, expr
             index_type := resolve_expression_type(state, scope, expression.rhs);
             if is_unknown_type(lhs_type) || is_unknown_type(index_type) {
                 result = unknown_type();
+            } else if lhs_type.kind == .ARRAY && lhs_type.pointee != null {
+                result = lhs_type.pointee.*;
             } else {
                 result = unknown_type();
             }
@@ -385,6 +389,16 @@ resolve_type_node :: (type_node: *Node) -> Resolved_Type {
             pointee.* = resolve_type_node(type_node.type_node);
             return .{ kind = .POINTER, pointee = pointee };
 
+        case .ARRAY_TYPE;
+            element := New(Resolved_Type);
+            element.* = resolve_type_node(type_node.type_node);
+            count := 0;
+            if type_node.rhs != null && type_node.rhs.kind == .INT_LITERAL_EXPR {
+                parsed_count, ok, _ := string_to_int(type_node.rhs.literal);
+                if ok count = parsed_count;
+            }
+            return .{ kind = .ARRAY, pointee = element, array_count = count };
+
         case .POLYMORPHIC_TYPE;
             return unknown_type();
 
@@ -468,6 +482,10 @@ same_type :: (a: Resolved_Type, b: Resolved_Type) -> bool {
         case .POINTER;
             if a.pointee == null || b.pointee == null return a.pointee == b.pointee;
             return same_type(a.pointee.*, b.pointee.*);
+        case .ARRAY;
+            if a.array_count != b.array_count return false;
+            if a.pointee == null || b.pointee == null return a.pointee == b.pointee;
+            return same_type(a.pointee.*, b.pointee.*);
     }
     return false;
 }
@@ -505,6 +523,9 @@ type_to_string :: (value_type: Resolved_Type) -> string {
         case .POINTER;
             if value_type.pointee == null return "*<invalid>";
             return tprint("*%", type_to_string(value_type.pointee.*));
+        case .ARRAY;
+            if value_type.pointee == null return "[]<invalid>";
+            return tprint("[%] %", value_type.array_count, type_to_string(value_type.pointee.*));
     }
 
     return "<invalid>";
