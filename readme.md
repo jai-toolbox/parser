@@ -21,8 +21,9 @@ The procedures that you need to care about are:
 
 ## Remaining Logic
 
-The parser is still not a complete Jai parser. It now covers the syntax needed
-for most modules, but many areas are still shallow or syntactic-only:
+The parser is still not a complete Jai parser, but it currently parses every
+`.jai` file under `C:\Users\ccn\projects\jai\modules` in the local toolchain
+snapshot: 547 passed, 0 failed. Many areas are still shallow or syntactic-only:
 
 - imports, `#load`, and compiler directives are mostly skipped or represented
   coarsely rather than modeled as rich AST nodes
@@ -30,5 +31,3 @@ for most modules, but many areas are still shallow or syntactic-only:
   but are not semantically analyzed in depth
 - semantic analysis remains partial: no complete name resolution, overload
   resolution, compile-time execution model, or type checking
-- full coverage of generated/binding-heavy Jai modules still needs more type
-  syntax and declaration-shape work

@@ -64,6 +64,28 @@ parse_file :: (ps: *Parse_State) -> *Node {
             continue;
         }
 
+        if match(ps, .AT) {
+            skip_top_level_annotation(ps);
+            continue;
+        }
+
+        if match(ps, .ELSE) {
+            skip_top_level_else_directive(ps);
+            continue;
+        }
+
+        if match(ps, .USING) {
+            skip_param_modifiers(ps);
+            if !is_top_level_using_declaration(ps) {
+                skip_top_level_using_statement(ps);
+                continue;
+            }
+
+            decl := parse_top_level_declaration(ps);
+            if decl array_add(*root.declarations, decl);
+            continue;
+        }
+
         decl := parse_top_level_declaration(ps);
         if decl array_add(*root.declarations, decl);
     }
@@ -73,20 +95,39 @@ parse_file :: (ps: *Parse_State) -> *Node {
 
 skip_top_level_compiler_directive :: (ps: *Parse_State) {
     start_line := previous(ps).span.line;
+    continued_line := false;
 
     while !check(ps, .EOF) && !ps.has_error {
         if match(ps, .SEMICOLON) return;
 
+        if match(ps, .OPEN_PAREN) {
+            skip_balanced_tokens(ps, .OPEN_PAREN, .CLOSE_PAREN);
+            continue;
+        }
+
+        if match(ps, .OPEN_BRACKET) {
+            skip_balanced_tokens(ps, .OPEN_BRACKET, .CLOSE_BRACKET);
+            continue;
+        }
+
         if match(ps, .OPEN_BRACE) {
             skip_balanced_tokens(ps, .OPEN_BRACE, .CLOSE_BRACE);
             skip_top_level_compiler_directive_else_chain(ps);
+            match(ps, .SEMICOLON);
             return;
         }
 
-        if current(ps).span.line > start_line return;
+        if current(ps).span.line > start_line {
+            if is_directive_continuation_token(current(ps).kind) continued_line = true;
+            if !continued_line return;
+        }
 
         advance(ps);
     }
+}
+
+is_directive_continuation_token :: (kind: Token_Kind) -> bool {
+    return kind == .OR_OR || kind == .AND_AND || kind == .PIPE || kind == .AMPERSAND || kind == .PLUS || kind == .MINUS || kind == .STAR || kind == .SLASH;
 }
 
 skip_top_level_compiler_directive_else_chain :: (ps: *Parse_State) {
@@ -121,6 +162,72 @@ skip_balanced_tokens :: (ps: *Parse_State, open_kind: Token_Kind, close_kind: To
     }
 }
 
+skip_expression_until_statement_end :: (ps: *Parse_State) {
+    while !check(ps, .SEMICOLON) && !check(ps, .EOF) && !ps.has_error {
+        if match(ps, .OPEN_PAREN) {
+            skip_balanced_tokens(ps, .OPEN_PAREN, .CLOSE_PAREN);
+            continue;
+        }
+
+        if match(ps, .OPEN_BRACKET) {
+            skip_balanced_tokens(ps, .OPEN_BRACKET, .CLOSE_BRACKET);
+            continue;
+        }
+
+        if match(ps, .OPEN_BRACE) {
+            skip_balanced_tokens(ps, .OPEN_BRACE, .CLOSE_BRACE);
+            continue;
+        }
+
+        advance(ps);
+    }
+
+    match(ps, .SEMICOLON);
+}
+
+is_top_level_using_declaration :: (ps: *Parse_State) -> bool {
+    return check(ps, .IDENTIFIER) && (check_at(ps, 1, .COLON_COLON) || check_at(ps, 1, .COLON) || check_at(ps, 1, .COMMA));
+}
+
+skip_top_level_using_statement :: (ps: *Parse_State) {
+    start_line := current(ps).span.line;
+
+    while !check(ps, .EOF) && !ps.has_error {
+        if match(ps, .SEMICOLON) return;
+        if current(ps).span.line > start_line return;
+        advance(ps);
+    }
+}
+
+skip_top_level_else_directive :: (ps: *Parse_State) {
+    start_line := previous(ps).span.line;
+
+    while !check(ps, .EOF) && !ps.has_error {
+        if match(ps, .SEMICOLON) return;
+        if match(ps, .OPEN_BRACE) {
+            skip_balanced_tokens(ps, .OPEN_BRACE, .CLOSE_BRACE);
+            match(ps, .SEMICOLON);
+            return;
+        }
+        if current(ps).span.line > start_line return;
+        advance(ps);
+    }
+}
+
+skip_top_level_annotation :: (ps: *Parse_State) {
+    start_line := previous(ps).span.line;
+
+    while !check(ps, .EOF) && !ps.has_error {
+        if match(ps, .SEMICOLON) return;
+        if match(ps, .OPEN_PAREN) {
+            skip_balanced_tokens(ps, .OPEN_PAREN, .CLOSE_PAREN);
+            continue;
+        }
+        if current(ps).span.line > start_line return;
+        advance(ps);
+    }
+}
+
 parse_top_level_declaration :: (ps: *Parse_State) -> *Node {
     name_token := expect(ps, .IDENTIFIER, "Expected top-level declaration name");
 
@@ -135,6 +242,8 @@ parse_top_level_declaration :: (ps: *Parse_State) -> *Node {
     }
 
     if match(ps, .COLON) return parse_global_typed_declaration_after_name(ps, name_token);
+
+    if match(ps, .COMMA) return parse_global_group_typed_declaration_after_name(ps, name_token);
 
     expect(ps, .COLON_COLON, "Expected '::' after top-level declaration name");
 
@@ -185,6 +294,14 @@ parse_operator_declaration_after_name :: (ps: *Parse_State, operator_token: Toke
     }
 
     expect(ps, .COLON_COLON, "Expected '::' after operator declaration name");
+    skip_declaration_modifiers(ps);
+    if !check(ps, .OPEN_PAREN) {
+        node := new_node(.CONST_DECL, operator_token.span);
+        node.name = name;
+        skip_expression_until_statement_end(ps);
+        return node;
+    }
+
     fn := parse_function_after_header(ps, operator_token);
     fn.name = name;
     return fn;
@@ -204,6 +321,11 @@ parse_enum_after_header :: (ps: *Parse_State, name_token: Token) -> *Node {
     while !check(ps, .CLOSE_BRACE) && !check(ps, .EOF) && !ps.has_error {
         if check(ps, .IDENTIFIER) {
             value := advance(ps);
+            if match(ps, .COLON_COLON) {
+                skip_enum_scoped_declaration(ps);
+                continue;
+            }
+
             entry := new_node(.CONST_DECL, value.span);
             entry.name = value.text;
             array_add(*node.declarations, entry);
@@ -222,6 +344,26 @@ parse_enum_after_header :: (ps: *Parse_State, name_token: Token) -> *Node {
     return node;
 }
 
+skip_enum_scoped_declaration :: (ps: *Parse_State) {
+    while !check(ps, .SEMICOLON) && !check(ps, .CLOSE_BRACE) && !check(ps, .EOF) && !ps.has_error {
+        if match(ps, .OPEN_PAREN) {
+            skip_balanced_tokens(ps, .OPEN_PAREN, .CLOSE_PAREN);
+            continue;
+        }
+
+        if match(ps, .OPEN_BRACE) {
+            skip_balanced_tokens(ps, .OPEN_BRACE, .CLOSE_BRACE);
+            match(ps, .SEMICOLON);
+            return;
+        }
+
+        advance(ps);
+    }
+
+    match(ps, .SEMICOLON);
+    match(ps, .COMMA);
+}
+
 parse_global_typed_declaration_after_name :: (ps: *Parse_State, name_token: Token) -> *Node {
     node := new_node(.GLOBAL_TYPED_DECL, name_token.span);
     node.name = name_token.text;
@@ -232,6 +374,48 @@ parse_global_typed_declaration_after_name :: (ps: *Parse_State, name_token: Toke
     }
 
     match(ps, .SEMICOLON);
+    return node;
+}
+
+parse_global_group_typed_declaration_after_name :: (ps: *Parse_State, first_name: Token) -> *Node {
+    node := new_node(.LOCAL_GROUP_DECL, first_name.span);
+    names: [..] Token;
+    array_add(*names, first_name);
+
+    while !ps.has_error {
+        name := expect(ps, .IDENTIFIER, "Expected global name after ','");
+        array_add(*names, name);
+        if !match(ps, .COMMA) break;
+    }
+
+    if match(ps, .COLON_EQUAL) {
+        value := parse_expression_list(ps);
+        match(ps, .SEMICOLON);
+
+        for names {
+            global := new_node(.LOCAL_INFER_DECL, it.span);
+            global.name = it.text;
+            global.rhs = value;
+            array_add(*node.declarations, global);
+        }
+
+        return node;
+    }
+
+    expect(ps, .COLON, "Expected ':' after global names");
+    value_type := parse_type(ps);
+    default_value: *Node = null;
+    if match(ps, .EQUAL) || match(ps, .COLON) default_value = parse_expression(ps);
+    match(ps, .SEMICOLON);
+
+    for names {
+        global := new_node(.GLOBAL_TYPED_DECL, it.span);
+        global.name = it.text;
+        global.type_node = value_type;
+        global.rhs = default_value;
+        array_add(*node.declarations, global);
+    }
+
     return node;
 }
 
@@ -271,10 +455,20 @@ parse_function_after_header :: (ps: *Parse_State, name_token: Token) -> *Node {
 skip_function_body_directives :: (ps: *Parse_State) -> bool {
     while match(ps, .HASH) {
         start_line := previous(ps).span.line;
+        directive_name := "";
+        if check(ps, .IDENTIFIER) {
+            directive_name = current(ps).text;
+            advance(ps);
+        }
+
         while !check(ps, .OPEN_BRACE) && !check(ps, .EOF) && !ps.has_error {
             if match(ps, .SEMICOLON) return false;
             if current(ps).span.line > start_line break;
             advance(ps);
+        }
+
+        if directive_name == "modify" && match(ps, .OPEN_BRACE) {
+            skip_balanced_tokens(ps, .OPEN_BRACE, .CLOSE_BRACE);
         }
     }
 
@@ -289,6 +483,7 @@ parse_struct_after_header :: (ps: *Parse_State, name_token: Token) -> *Node {
         skip_balanced_tokens(ps, .OPEN_PAREN, .CLOSE_PAREN);
     }
 
+    skip_struct_header_directives(ps);
     expect(ps, .OPEN_BRACE, "Expected '{' before struct body");
     while !check(ps, .CLOSE_BRACE) && !check(ps, .EOF) && !ps.has_error {
         if match(ps, .STRUCT) || match(ps, .UNION) {
@@ -308,20 +503,33 @@ parse_struct_after_header :: (ps: *Parse_State, name_token: Token) -> *Node {
             continue;
         }
 
+        if match(ps, .HASH) {
+            skip_struct_compiler_directive(ps);
+            continue;
+        }
+
         if match(ps, .USING) {
             field := parse_using_struct_field(ps, previous(ps));
             if field array_add(*node.declarations, field);
             continue;
         }
 
-        field_name := expect(ps, .IDENTIFIER, "Expected struct field name");
+        field_name := expect_name_token(ps, "Expected struct field name");
+
+        if check(ps, .DOT) || check(ps, .OPEN_BRACKET) {
+            skip_struct_body_statement(ps);
+            continue;
+        }
 
         if match(ps, .COLON_COLON) {
             nested: *Node = null;
             if match(ps, .STRUCT) || match(ps, .UNION) nested = parse_struct_after_header(ps, field_name);
             else if match(ps, .ENUM) || match(ps, .ENUM_FLAGS) nested = parse_enum_after_header(ps, field_name);
-            else if check(ps, .OPEN_PAREN) && is_function_header_ahead(ps) nested = parse_function_after_header(ps, field_name);
             else {
+                skip_declaration_modifiers(ps);
+                if check(ps, .OPEN_PAREN) && is_function_header_ahead(ps) nested = parse_function_after_header(ps, field_name);
+            }
+            if !nested {
                 nested = new_node(.CONST_DECL, field_name.span);
                 nested.name = field_name.text;
                 nested.rhs = parse_expression(ps);
@@ -354,7 +562,7 @@ parse_struct_after_header :: (ps: *Parse_State, name_token: Token) -> *Node {
         array_add(*field_names, field_name);
 
         while match(ps, .COMMA) {
-            next_name := expect(ps, .IDENTIFIER, "Expected struct field name after ','");
+            next_name := expect_name_token(ps, "Expected struct field name after ','");
             array_add(*field_names, next_name);
         }
 
@@ -377,6 +585,56 @@ parse_struct_after_header :: (ps: *Parse_State, name_token: Token) -> *Node {
     return node;
 }
 
+skip_struct_body_statement :: (ps: *Parse_State) {
+    while !check(ps, .SEMICOLON) && !check(ps, .CLOSE_BRACE) && !check(ps, .EOF) && !ps.has_error {
+        if match(ps, .OPEN_BRACE) {
+            skip_balanced_tokens(ps, .OPEN_BRACE, .CLOSE_BRACE);
+            continue;
+        }
+
+        advance(ps);
+    }
+
+    match(ps, .SEMICOLON);
+}
+
+skip_struct_header_directives :: (ps: *Parse_State) {
+    while match(ps, .HASH) {
+        start_line := previous(ps).span.line;
+        directive_name := "";
+        if check(ps, .IDENTIFIER) {
+            directive_name = current(ps).text;
+            advance(ps);
+        }
+
+        while !check(ps, .OPEN_BRACE) && !check(ps, .EOF) && !ps.has_error {
+            if current(ps).span.line > start_line break;
+            advance(ps);
+        }
+
+        if directive_name == "modify" && match(ps, .OPEN_BRACE) {
+            skip_balanced_tokens(ps, .OPEN_BRACE, .CLOSE_BRACE);
+        }
+    }
+}
+
+skip_struct_compiler_directive :: (ps: *Parse_State) {
+    start_line := previous(ps).span.line;
+
+    while !check(ps, .EOF) && !ps.has_error {
+        if match(ps, .SEMICOLON) return;
+        if match(ps, .OPEN_BRACE) {
+            skip_balanced_tokens(ps, .OPEN_BRACE, .CLOSE_BRACE);
+            skip_top_level_compiler_directive_else_chain(ps);
+            match(ps, .SEMICOLON);
+            return;
+        }
+        if check(ps, .CLOSE_BRACE) return;
+        if current(ps).span.line > start_line return;
+        advance(ps);
+    }
+}
+
 skip_struct_annotation :: (ps: *Parse_State) {
     start_line := previous(ps).span.line;
     while !check(ps, .EOF) && !ps.has_error {
@@ -394,7 +652,7 @@ parse_hash_as_using_struct_field :: (ps: *Parse_State) -> *Node {
         return null;
     }
 
-    expect(ps, .USING, "Expected 'using' after '#as'");
+    if match(ps, .USING) skip_param_modifiers(ps);
     name_token := expect(ps, .IDENTIFIER, "Expected using struct field name");
     expect(ps, .COLON, "Expected ':' after using struct field name");
 
@@ -407,6 +665,8 @@ parse_hash_as_using_struct_field :: (ps: *Parse_State) -> *Node {
 }
 
 parse_using_struct_field :: (ps: *Parse_State, using_token: Token) -> *Node {
+    skip_param_modifiers(ps);
+
     if match(ps, .HASH) {
         name := advance(ps);
         if name.text != "as" {
@@ -416,6 +676,15 @@ parse_using_struct_field :: (ps: *Parse_State, using_token: Token) -> *Node {
     }
 
     name_token := expect(ps, .IDENTIFIER, "Expected using struct field name");
+    if match(ps, .SEMICOLON) {
+        field := new_node(.STRUCT_FIELD, using_token.span);
+        field.name = name_token.text;
+        type_node := new_node(.TYPE_NAME, name_token.span);
+        type_node.name = name_token.text;
+        field.type_node = type_node;
+        return field;
+    }
+
     expect(ps, .COLON, "Expected ':' after using struct field name");
 
     field := new_node(.STRUCT_FIELD, using_token.span);
@@ -430,15 +699,13 @@ parse_param :: (ps: *Parse_State) -> *Node {
     match(ps, .USING);
     skip_param_modifiers(ps);
 
-    is_polymorphic := match(ps, .DOLLAR);
+    dollar_count := 0;
+    while match(ps, .DOLLAR) dollar_count += 1;
     name_token := expect(ps, .IDENTIFIER, "Expected parameter name");
 
     param := new_node(.PARAM, name_token.span);
-    if is_polymorphic {
-        param.name = tprint("$%", name_token.text);
-    } else {
-        param.name = name_token.text;
-    }
+    param.name = name_token.text;
+    for 0..dollar_count-1 param.name = tprint("$%", param.name);
 
     if match(ps, .COLON_EQUAL) {
         param.rhs = parse_expression(ps);
@@ -461,6 +728,21 @@ skip_param_modifiers :: (ps: *Parse_State) {
 }
 
 parse_type :: (ps: *Parse_State) -> *Node {
+    if match(ps, .HASH) {
+        hash := previous(ps);
+        name := expect(ps, .IDENTIFIER, "Expected type directive name after '#'");
+        if name.text == "type" {
+            node := parse_type(ps);
+            skip_type_suffix_directives(ps);
+            return node;
+        }
+
+        node := new_node(.TYPE_NAME, hash.span);
+        node.name = tprint("#%", name.text);
+        skip_type_suffix_directives(ps);
+        return node;
+    }
+
     if check(ps, .OPEN_PAREN) return parse_function_type(ps);
 
     if match(ps, .STRUCT) || match(ps, .UNION) return parse_struct_after_header(ps, previous(ps));
@@ -505,7 +787,8 @@ parse_type :: (ps: *Parse_State) -> *Node {
             match(ps, .INTERFACE);
 
             constraint := new_node(.INTERFACE_TYPE, slash.span);
-            constraint.type_node = parse_type(ps);
+            if check(ps, .DOT) || check(ps, .OPEN_BRACKET) constraint.type_node = parse_expression(ps);
+            else constraint.type_node = parse_type(ps);
             node.type_node = constraint;
         }
 
@@ -527,7 +810,7 @@ parse_type :: (ps: *Parse_State) -> *Node {
 
         if !check(ps, .CLOSE_PAREN) {
             while !ps.has_error {
-                arg := parse_type(ps);
+                arg := parse_type_application_argument(ps);
                 if arg array_add(*application.args, arg);
                 if !match(ps, .COMMA) break;
                 if check(ps, .CLOSE_PAREN) break;
@@ -545,6 +828,31 @@ parse_type :: (ps: *Parse_State) -> *Node {
     }
 
     return node;
+}
+
+parse_type_application_argument :: (ps: *Parse_State) -> *Node {
+    if check(ps, .INT_LITERAL) || check(ps, .FLOAT_LITERAL) || check(ps, .STRING_LITERAL) || check(ps, .DOT) || check(ps, .DOLLAR) {
+        return parse_expression(ps);
+    }
+
+    return parse_type(ps);
+}
+
+skip_type_suffix_directives :: (ps: *Parse_State) {
+    while match(ps, .HASH) {
+        start_line := previous(ps).span.line;
+        if check(ps, .IDENTIFIER) advance(ps);
+
+        while !check(ps, .OPEN_BRACE) && !check(ps, .SEMICOLON) && !check(ps, .COMMA) && !check(ps, .CLOSE_PAREN) && !check(ps, .CLOSE_BRACE) && !check(ps, .EQUAL) && !check(ps, .COLON) && !check(ps, .EOF) && !ps.has_error {
+            if current(ps).span.line > start_line return;
+            if match(ps, .OPEN_PAREN) {
+                skip_balanced_tokens(ps, .OPEN_PAREN, .CLOSE_PAREN);
+                continue;
+            }
+
+            advance(ps);
+        }
+    }
 }
 
 parse_anonymous_enum_type :: (ps: *Parse_State, enum_token: Token) -> *Node {
@@ -577,6 +885,8 @@ parse_anonymous_enum_type :: (ps: *Parse_State, enum_token: Token) -> *Node {
 }
 
 parse_return_type :: (ps: *Parse_State) -> *Node {
+    if check(ps, .OPEN_PAREN) && is_parenthesized_return_type_list_ahead(ps) return parse_parenthesized_return_type_list(ps);
+
     first := parse_return_type_item(ps);
     if !match(ps, .COMMA) return first;
 
@@ -596,8 +906,45 @@ parse_return_type :: (ps: *Parse_State) -> *Node {
     return node;
 }
 
+is_parenthesized_return_type_list_ahead :: (ps: *Parse_State) -> bool {
+    if !check(ps, .OPEN_PAREN) return false;
+
+    scan := ps.index + 1;
+    depth := 1;
+    while scan < ps.tokens.count && depth > 0 {
+        kind := ps.tokens[scan].kind;
+        if kind == .OPEN_PAREN depth += 1;
+        else if kind == .CLOSE_PAREN depth -= 1;
+        else if depth == 1 && (kind == .COLON || kind == .COLON_EQUAL) return true;
+        scan += 1;
+    }
+
+    return false;
+}
+
+parse_parenthesized_return_type_list :: (ps: *Parse_State) -> *Node {
+    open := expect(ps, .OPEN_PAREN, "Expected '(' before return type list");
+    node := new_node(.TYPE_LIST, open.span);
+
+    if !check(ps, .CLOSE_PAREN) {
+        while !ps.has_error {
+            item := parse_return_type_item(ps);
+            if item {
+                if item.kind == .PARAM array_add(*node.params, item);
+                else array_add(*node.args, item);
+            }
+
+            if !match(ps, .COMMA) break;
+            if check(ps, .CLOSE_PAREN) break;
+        }
+    }
+
+    expect(ps, .CLOSE_PAREN, "Expected ')' after return type list");
+    return node;
+}
+
 parse_return_type_item :: (ps: *Parse_State) -> *Node {
-    if check(ps, .IDENTIFIER) && check_at(ps, 1, .COLON) return parse_param(ps);
+    if check(ps, .IDENTIFIER) && (check_at(ps, 1, .COLON) || check_at(ps, 1, .COLON_EQUAL)) return parse_param(ps);
     return parse_type(ps);
 }
 
@@ -619,6 +966,11 @@ parse_block_after_open :: (ps: *Parse_State, open: Token) -> *Node {
 }
 
 parse_statement :: (ps: *Parse_State) -> *Node {
+    if match(ps, .SEMICOLON) return null;
+    if match(ps, .AT) {
+        skip_top_level_annotation(ps);
+        return null;
+    }
     if match(ps, .BACKTICK) return parse_statement(ps);
     if match(ps, .HASH) return parse_compiler_directive_statement(ps, previous(ps));
     if match(ps, .OPEN_BRACE) return parse_block_after_open(ps, previous(ps));
@@ -627,12 +979,19 @@ parse_statement :: (ps: *Parse_State) -> *Node {
     if match(ps, .FOR) return parse_for_statement(ps, previous(ps));
     if match(ps, .WHILE) return parse_while_statement(ps, previous(ps));
     if match(ps, .DEFER) return parse_defer_statement(ps, previous(ps));
+    if match(ps, .ELSE) return parse_standalone_else_statement(ps, previous(ps));
     if match(ps, .USING) return parse_using_local_statement(ps);
+    if match(ps, .STRUCT) || match(ps, .UNION) return parse_struct_after_header(ps, previous(ps));
 
     if check(ps, .IDENTIFIER) {
         if check_at(ps, 1, .COLON_COLON) return parse_local_colon_colon_declaration(ps);
         if check_at(ps, 1, .COLON_EQUAL) return parse_local_infer_decl(ps);
+        if check_at(ps, 1, .EQUAL) && check_at(ps, 2, .COMMA) return parse_mixed_assignment_declaration(ps);
+        if check_at(ps, 1, .COMMA) && is_mixed_assignment_declaration_ahead(ps) return parse_mixed_assignment_declaration(ps);
+        if check_at(ps, 1, .COMMA) && is_local_declaration_assignment_list_ahead(ps) return parse_local_declaration_assignment_list(ps);
+        if check_at(ps, 1, .COMMA) && is_local_group_constant_declaration_ahead(ps) return parse_local_group_constant_decl(ps);
         if check_at(ps, 1, .COMMA) && is_local_group_declaration_ahead(ps) return parse_local_group_decl(ps);
+        if check_at(ps, 1, .COLON) && (check_at(ps, 2, .COMMA) || check_at(ps, 2, .EQUAL)) return parse_local_declaration_assignment(ps);
         if check_at(ps, 1, .COLON) return parse_local_typed_decl(ps);
     }
 
@@ -649,7 +1008,7 @@ parse_statement :: (ps: *Parse_State) -> *Node {
         return node;
     }
 
-    if match(ps, .PLUS_EQUAL) || match(ps, .MINUS_EQUAL) || match(ps, .STAR_EQUAL) || match(ps, .SLASH_EQUAL) || match(ps, .PERCENT_EQUAL) || match(ps, .AMPERSAND_EQUAL) || match(ps, .CARET_EQUAL) || match(ps, .PIPE_EQUAL) || match(ps, .LESS_LESS_EQUAL) || match(ps, .GREATER_GREATER_EQUAL) {
+    if match(ps, .PLUS_EQUAL) || match(ps, .MINUS_EQUAL) || match(ps, .STAR_EQUAL) || match(ps, .SLASH_EQUAL) || match(ps, .PERCENT_EQUAL) || match(ps, .AMPERSAND_EQUAL) || match(ps, .AND_AND_EQUAL) || match(ps, .CARET_EQUAL) || match(ps, .PIPE_EQUAL) || match(ps, .OR_OR_EQUAL) || match(ps, .LESS_LESS_EQUAL) || match(ps, .GREATER_GREATER_EQUAL) {
         op := previous(ps);
         node := new_node(.COMPOUND_ASSIGNMENT, lhs.span);
         node.lhs = lhs;
@@ -661,6 +1020,23 @@ parse_statement :: (ps: *Parse_State) -> *Node {
 
     node := new_node(.EXPRESSION_STATEMENT, lhs.span);
     node.rhs = lhs;
+    match(ps, .SEMICOLON);
+    return node;
+}
+
+parse_standalone_else_statement :: (ps: *Parse_State, else_token: Token) -> *Node {
+    node := new_node(.COMPILER_DIRECTIVE_STATEMENT, else_token.span);
+    node.name = "else";
+
+    if match(ps, .OPEN_BRACE) {
+        node.body = parse_block_after_open(ps, previous(ps));
+        return node;
+    }
+
+    while !check(ps, .SEMICOLON) && !check(ps, .CLOSE_BRACE) && !check(ps, .EOF) && !ps.has_error {
+        advance(ps);
+    }
+
     match(ps, .SEMICOLON);
     return node;
 }
@@ -696,6 +1072,143 @@ is_local_group_declaration_ahead :: (ps: *Parse_State) -> bool {
     }
 
     return false;
+}
+
+is_local_group_constant_declaration_ahead :: (ps: *Parse_State) -> bool {
+    scan := ps.index;
+
+    while scan < ps.tokens.count {
+        if ps.tokens[scan].kind != .IDENTIFIER return false;
+        scan += 1;
+
+        if scan >= ps.tokens.count return false;
+        if ps.tokens[scan].kind == .COLON_COLON return true;
+        if ps.tokens[scan].kind != .COMMA return false;
+        scan += 1;
+    }
+
+    return false;
+}
+
+parse_local_group_constant_decl :: (ps: *Parse_State) -> *Node {
+    first_name := expect(ps, .IDENTIFIER, "Expected local constant name");
+    node := new_node(.LOCAL_GROUP_DECL, first_name.span);
+    names: [..] Token;
+    array_add(*names, first_name);
+
+    while match(ps, .COMMA) {
+        name := expect(ps, .IDENTIFIER, "Expected local constant name after ','");
+        array_add(*names, name);
+    }
+
+    expect(ps, .COLON_COLON, "Expected '::' after local constant names");
+    value := parse_expression_list(ps);
+    match(ps, .SEMICOLON);
+
+    for names {
+        local := new_node(.CONST_DECL, it.span);
+        local.name = it.text;
+        local.rhs = value;
+        array_add(*node.declarations, local);
+    }
+
+    return node;
+}
+
+is_mixed_assignment_declaration_ahead :: (ps: *Parse_State) -> bool {
+    scan := ps.index;
+    saw_equal_marker := false;
+
+    while scan < ps.tokens.count {
+        kind := ps.tokens[scan].kind;
+        if kind == .COLON_EQUAL return saw_equal_marker;
+        if kind == .EQUAL saw_equal_marker = true;
+        if kind == .SEMICOLON || kind == .CLOSE_BRACE || kind == .EOF return false;
+        scan += 1;
+    }
+
+    return false;
+}
+
+is_local_declaration_assignment_list_ahead :: (ps: *Parse_State) -> bool {
+    scan := ps.index;
+    saw_colon := false;
+
+    while scan < ps.tokens.count {
+        kind := ps.tokens[scan].kind;
+        if kind == .COLON {
+            next := scan + 1;
+            if next < ps.tokens.count && (ps.tokens[next].kind == .COMMA || ps.tokens[next].kind == .EQUAL) {
+                saw_colon = true;
+            }
+        } else if kind == .EQUAL {
+            return saw_colon;
+        } else if kind == .SEMICOLON || kind == .CLOSE_BRACE || kind == .EOF {
+            return false;
+        }
+
+        scan += 1;
+    }
+
+    return false;
+}
+
+parse_local_declaration_assignment_list :: (ps: *Parse_State) -> *Node {
+    first_name := expect(ps, .IDENTIFIER, "Expected local name");
+    node := new_node(.LOCAL_GROUP_DECL, first_name.span);
+
+    local := new_node(.LOCAL_INFER_DECL, first_name.span);
+    local.name = first_name.text;
+    array_add(*node.declarations, local);
+    match(ps, .COLON);
+
+    while match(ps, .COMMA) {
+        name := expect(ps, .IDENTIFIER, "Expected local name after ','");
+        local = new_node(.LOCAL_INFER_DECL, name.span);
+        local.name = name.text;
+        array_add(*node.declarations, local);
+        match(ps, .COLON);
+    }
+
+    expect(ps, .EQUAL, "Expected '=' after local declaration assignment");
+    node.rhs = parse_expression_list(ps);
+    match(ps, .SEMICOLON);
+    return node;
+}
+
+parse_mixed_assignment_declaration :: (ps: *Parse_State) -> *Node {
+    first_name := expect(ps, .IDENTIFIER, "Expected assignment name");
+    node := new_node(.LOCAL_GROUP_DECL, first_name.span);
+
+    while !check(ps, .COLON_EQUAL) && !check(ps, .SEMICOLON) && !check(ps, .EOF) && !ps.has_error {
+        advance(ps);
+    }
+
+    if match(ps, .COLON_EQUAL) {
+        node.rhs = parse_expression_list(ps);
+    }
+
+    match(ps, .SEMICOLON);
+    return node;
+}
+
+parse_local_declaration_assignment :: (ps: *Parse_State) -> *Node {
+    first_name := expect(ps, .IDENTIFIER, "Expected local name");
+    expect(ps, .COLON, "Expected ':' after local declaration name");
+
+    node := new_node(.LOCAL_GROUP_DECL, first_name.span);
+    local := new_node(.LOCAL_INFER_DECL, first_name.span);
+    local.name = first_name.text;
+    array_add(*node.declarations, local);
+
+    while !check(ps, .EQUAL) && !check(ps, .SEMICOLON) && !check(ps, .EOF) && !ps.has_error {
+        advance(ps);
+    }
+
+    expect(ps, .EQUAL, "Expected '=' after local declaration assignment");
+    node.rhs = parse_expression_list(ps);
+    match(ps, .SEMICOLON);
+    return node;
 }
 
 parse_local_colon_colon_declaration :: (ps: *Parse_State) -> *Node {
@@ -778,11 +1291,7 @@ parse_if_statement :: (ps: *Parse_State, if_token: Token) -> *Node {
 parse_for_statement :: (ps: *Parse_State, for_token: Token) -> *Node {
     node := new_node(.FOR_STATEMENT, for_token.span);
 
-    while match(ps, .COLON) {
-        advance(ps);
-    }
-    while match(ps, .LESS) || match(ps, .GREATER) {
-    }
+    skip_for_modifiers(ps);
 
     if is_for_iterator_header_ahead(ps) {
         node.name = parse_for_iterator_names(ps);
@@ -807,11 +1316,42 @@ parse_for_statement :: (ps: *Parse_State, for_token: Token) -> *Node {
     return node;
 }
 
+skip_for_modifiers :: (ps: *Parse_State) {
+    while !ps.has_error {
+        if match(ps, .COLON) {
+            if !check(ps, .OPEN_BRACE) && !check(ps, .IDENTIFIER) advance(ps);
+            continue;
+        }
+
+        if match(ps, .LESS_EQUAL) || match(ps, .GREATER_EQUAL) || match(ps, .STAR_EQUAL) {
+            parse_expression(ps);
+            continue;
+        }
+
+        if check(ps, .STAR) && !is_pointer_iterator_start(ps) {
+            advance(ps);
+            continue;
+        }
+
+        if match(ps, .LESS) || match(ps, .GREATER) {
+            continue;
+        }
+
+        break;
+    }
+}
+
+is_pointer_iterator_start :: (ps: *Parse_State) -> bool {
+    if !check(ps, .STAR) || !check_at(ps, 1, .IDENTIFIER) return false;
+    return check_at(ps, 2, .COLON) || check_at(ps, 2, .COMMA);
+}
+
 is_for_iterator_header_ahead :: (ps: *Parse_State) -> bool {
     scan := ps.index;
     saw_name := false;
 
     while scan < ps.tokens.count {
+        if ps.tokens[scan].kind == .BACKTICK scan += 1;
         if ps.tokens[scan].kind == .STAR {
             scan += 1;
             if scan >= ps.tokens.count || ps.tokens[scan].kind != .IDENTIFIER return false;
@@ -835,6 +1375,7 @@ parse_for_iterator_names :: (ps: *Parse_State) -> string {
     result := "";
 
     while !ps.has_error {
+        match(ps, .BACKTICK);
         is_pointer := match(ps, .STAR);
         name := expect(ps, .IDENTIFIER, "Expected for iterator name");
 
@@ -851,7 +1392,11 @@ parse_for_iterator_names :: (ps: *Parse_State) -> string {
 
 parse_while_statement :: (ps: *Parse_State, while_token: Token) -> *Node {
     node := new_node(.WHILE_STATEMENT, while_token.span);
-    node.lhs = parse_expression(ps);
+    if has_colon_equal_before_statement_body(ps) {
+        skip_until_statement_body(ps);
+    } else {
+        node.lhs = parse_expression(ps);
+    }
 
     if match(ps, .OPEN_BRACE) {
         node.body = parse_block_after_open(ps, previous(ps));
@@ -865,6 +1410,25 @@ parse_while_statement :: (ps: *Parse_State, while_token: Token) -> *Node {
     }
 
     return node;
+}
+
+has_colon_equal_before_statement_body :: (ps: *Parse_State) -> bool {
+    scan := ps.index;
+
+    while scan < ps.tokens.count {
+        kind := ps.tokens[scan].kind;
+        if kind == .OPEN_BRACE || kind == .SEMICOLON || kind == .CLOSE_BRACE || kind == .EOF return false;
+        if kind == .COLON_EQUAL return true;
+        scan += 1;
+    }
+
+    return false;
+}
+
+skip_until_statement_body :: (ps: *Parse_State) {
+    while !check(ps, .OPEN_BRACE) && !check(ps, .SEMICOLON) && !check(ps, .CLOSE_BRACE) && !check(ps, .EOF) && !ps.has_error {
+        advance(ps);
+    }
 }
 
 parse_defer_statement :: (ps: *Parse_State, defer_token: Token) -> *Node {
@@ -907,9 +1471,27 @@ parse_compiler_directive_statement :: (ps: *Parse_State, hash_token: Token) -> *
 parse_return_statement :: (ps: *Parse_State, return_token: Token) -> *Node {
     node := new_node(.RETURN_STATEMENT, return_token.span);
     if !check(ps, .SEMICOLON) && !check(ps, .CLOSE_BRACE) {
-        node.rhs = parse_expression_list(ps);
+        node.rhs = parse_return_expression_list(ps);
     }
     match(ps, .SEMICOLON);
+    return node;
+}
+
+parse_return_expression_list :: (ps: *Parse_State) -> *Node {
+    first := parse_call_argument(ps);
+    if first == null return null;
+    if !match(ps, .COMMA) return first;
+
+    node := new_node(.EXPRESSION_LIST, first.span);
+    array_add(*node.args, first);
+
+    while !ps.has_error {
+        if check(ps, .SEMICOLON) || check(ps, .CLOSE_BRACE) break;
+        next := parse_call_argument(ps);
+        if next array_add(*node.args, next);
+        if !match(ps, .COMMA) break;
+    }
+
     return node;
 }
 
@@ -949,7 +1531,7 @@ parse_local_group_decl :: (ps: *Parse_State) -> *Node {
     }
 
     if match(ps, .COLON_EQUAL) {
-        value := parse_expression(ps);
+        value := parse_expression_list(ps);
         match(ps, .SEMICOLON);
 
         for names {
@@ -981,7 +1563,21 @@ parse_local_group_decl :: (ps: *Parse_State) -> *Node {
 }
 
 parse_expression :: (ps: *Parse_State) -> *Node {
+    if check(ps, .IDENTIFIER) && check_at(ps, 1, .FAT_ARROW) return parse_single_name_lambda(ps);
     return parse_binary_expression(ps, 0);
+}
+
+parse_single_name_lambda :: (ps: *Parse_State) -> *Node {
+    name := expect(ps, .IDENTIFIER, "Expected lambda parameter name");
+    expect(ps, .FAT_ARROW, "Expected '=>' after lambda parameter name");
+
+    node := new_node(.LAMBDA_EXPR, name.span);
+    param := new_node(.PARAM, name.span);
+    param.name = name.text;
+    array_add(*node.params, param);
+    if match(ps, .OPEN_BRACE) node.body = parse_block_after_open(ps, previous(ps));
+    else node.rhs = parse_expression(ps);
+    return node;
 }
 
 parse_expression_list :: (ps: *Parse_State) -> *Node {
@@ -993,6 +1589,7 @@ parse_expression_list :: (ps: *Parse_State) -> *Node {
     array_add(*node.args, first);
 
     while !ps.has_error {
+        if check(ps, .SEMICOLON) || check(ps, .CLOSE_PAREN) || check(ps, .CLOSE_BRACE) || check(ps, .CLOSE_BRACKET) break;
         next := parse_expression(ps);
         if next array_add(*node.args, next);
         if !match(ps, .COMMA) break;
@@ -1023,7 +1620,19 @@ parse_binary_expression :: (ps: *Parse_State, min_precedence: int) -> *Node {
 }
 
 parse_unary_expression :: (ps: *Parse_State) -> *Node {
-    if match(ps, .PLUS) || match(ps, .MINUS) || match(ps, .STAR) || match(ps, .BANG) || match(ps, .TILDE) || match(ps, .XX) || match(ps, .DOT_DOT) || match(ps, .BACKTICK) {
+    if match(ps, .XX) {
+        op := previous(ps);
+        while match(ps, .COMMA) {
+            expect(ps, .IDENTIFIER, "Expected xx modifier after ','");
+        }
+
+        node := new_node(.UNARY_EXPR, op.span);
+        node.op = op.kind;
+        node.rhs = parse_unary_expression(ps);
+        return node;
+    }
+
+    if match(ps, .PLUS) || match(ps, .MINUS) || match(ps, .STAR) || match(ps, .BANG) || match(ps, .TILDE) || match(ps, .XX) || match(ps, .DOT_DOT) || match(ps, .BACKTICK) || match(ps, .LESS_LESS) || match(ps, .GREATER_GREATER) {
         op := previous(ps);
         node := new_node(.UNARY_EXPR, op.span);
         node.op = op.kind;
@@ -1047,6 +1656,15 @@ parse_postfix_expression :: (ps: *Parse_State) -> *Node {
 
             if match(ps, .OPEN_BRACKET) {
                 expr = parse_array_literal_after_open(ps, dot, expr);
+                continue;
+            }
+
+            if match(ps, .OPEN_PAREN) {
+                node := new_node(.CAST_EXPR, dot.span);
+                node.lhs = expr;
+                node.type_node = parse_type(ps);
+                expect(ps, .CLOSE_PAREN, "Expected ')' after postfix cast type");
+                expr = node;
                 continue;
             }
 
@@ -1125,10 +1743,29 @@ parse_primary_expression :: (ps: *Parse_State) -> *Node {
         ifx_token := previous(ps);
         node := new_node(.IFX_EXPR, ifx_token.span);
         node.lhs = parse_expression(ps);
+        if match(ps, .OPEN_BRACE) {
+            node.rhs = parse_block_after_open(ps, previous(ps));
+            expect(ps, .ELSE, "Expected 'else' in ifx expression");
+            if match(ps, .OPEN_BRACE) node.body = parse_block_after_open(ps, previous(ps));
+            else node.body = parse_expression(ps);
+            return node;
+        }
+
+        if match(ps, .ELSE) {
+            node.body = parse_expression(ps);
+            return node;
+        }
+
+        if !check(ps, .THEN) {
+            node.rhs = parse_expression(ps);
+            expect(ps, .ELSE, "Expected 'else' in ifx expression");
+            node.body = parse_expression(ps);
+            return node;
+        }
+
         expect(ps, .THEN, "Expected 'then' in ifx expression");
         node.rhs = parse_expression(ps);
-        expect(ps, .ELSE, "Expected 'else' in ifx expression");
-        node.body = parse_expression(ps);
+        if match(ps, .ELSE) node.body = parse_expression(ps);
         return node;
     }
 
@@ -1155,12 +1792,52 @@ parse_primary_expression :: (ps: *Parse_State) -> *Node {
             return node;
         }
 
-        if node.name == "type" && check(ps, .OPEN_PAREN) {
-            node.rhs = parse_function_type(ps);
+        if node.name == "type" {
+            node.type_node = parse_type(ps);
             return node;
         }
 
-        if check(ps, .STRING_LITERAL) || check(ps, .INT_LITERAL) || check(ps, .FLOAT_LITERAL) || check(ps, .IDENTIFIER) || check(ps, .OPEN_PAREN) {
+        if node.name == "ifx" {
+            node.lhs = parse_expression(ps);
+            if match(ps, .OPEN_BRACE) {
+                node.rhs = parse_block_after_open(ps, previous(ps));
+                expect(ps, .ELSE, "Expected 'else' in #ifx expression");
+                if match(ps, .OPEN_BRACE) node.body = parse_block_after_open(ps, previous(ps));
+                else node.body = parse_expression(ps);
+                return node;
+            }
+
+            if match(ps, .THEN) node.rhs = parse_expression(ps);
+            expect(ps, .ELSE, "Expected 'else' in #ifx expression");
+            node.body = parse_expression(ps);
+            return node;
+        }
+
+        if match(ps, .ARROW) {
+            node.return_type = parse_return_type(ps);
+        }
+
+        if match(ps, .OPEN_BRACE) {
+            node.body = parse_block_after_open(ps, previous(ps));
+            return node;
+        }
+
+        if match(ps, .OPEN_PAREN) {
+            if !check(ps, .CLOSE_PAREN) {
+                while !ps.has_error {
+                    arg := parse_call_argument(ps);
+                    if arg array_add(*node.args, arg);
+                    if !match(ps, .COMMA) break;
+                    if check(ps, .CLOSE_PAREN) break;
+                }
+            }
+
+            expect(ps, .CLOSE_PAREN, "Expected ')' after compiler directive arguments");
+            if can_start_primary_expression(ps) node.rhs = parse_expression(ps);
+            return node;
+        }
+
+        if can_start_primary_expression(ps) {
             node.rhs = parse_primary_expression(ps);
         }
 
@@ -1175,6 +1852,11 @@ parse_primary_expression :: (ps: *Parse_State) -> *Node {
         }
         expect(ps, .OPEN_PAREN, "Expected '(' after cast");
         node.type_node = parse_type(ps);
+        if match(ps, .COMMA) {
+            node.rhs = parse_expression_list(ps);
+            expect(ps, .CLOSE_PAREN, "Expected ')' after cast expression");
+            return node;
+        }
         expect(ps, .CLOSE_PAREN, "Expected ')' after cast type");
         node.rhs = parse_unary_expression(ps);
         return node;
@@ -1184,10 +1866,23 @@ parse_primary_expression :: (ps: *Parse_State) -> *Node {
         dot := previous(ps);
         if match(ps, .OPEN_BRACE) return parse_struct_literal_after_open(ps, dot, null);
         if match(ps, .OPEN_BRACKET) return parse_array_literal_after_open(ps, dot, null);
+        if match(ps, .STAR) {
+            node := new_node(.IDENTIFIER_EXPR, dot.span);
+            node.name = ".*";
+            return node;
+        }
 
         name := expect(ps, .IDENTIFIER, "Expected enum value name after '.'");
         node := new_node(.ENUM_VALUE_EXPR, dot.span);
         node.name = name.text;
+        return node;
+    }
+
+    if match(ps, .DOLLAR) {
+        dollar := previous(ps);
+        name := expect(ps, .IDENTIFIER, "Expected polymorphic expression name after '$'");
+        node := new_node(.IDENTIFIER_EXPR, dollar.span);
+        node.name = tprint("$%", name.text);
         return node;
     }
 
@@ -1224,13 +1919,18 @@ parse_primary_expression :: (ps: *Parse_State) -> *Node {
         return new_node(.UNINITIALIZED_EXPR, token.span);
     }
 
+    if check(ps, .STRUCT) || check(ps, .UNION) || check(ps, .ENUM) || check(ps, .ENUM_FLAGS) return parse_type(ps);
+
+    if match(ps, .OPEN_BRACE) return parse_struct_literal_after_open(ps, previous(ps), null);
+
     if check(ps, .OPEN_BRACKET) return parse_type(ps);
 
     if match(ps, .OPEN_PAREN) {
         open := previous(ps);
         if is_lambda_after_open(ps) return parse_lambda_after_open(ps, open);
 
-        if match(ps, .DOT) {
+        if check(ps, .DOT) && check_at(ps, 1, .STAR) {
+            advance(ps);
             expect(ps, .STAR, "Expected '*' after '(.' in dereference operator");
             expect(ps, .CLOSE_PAREN, "Expected ')' after '(.*' dereference operator");
             node := new_node(.UNARY_EXPR, open.span);
@@ -1248,6 +1948,21 @@ parse_primary_expression :: (ps: *Parse_State) -> *Node {
     return null;
 }
 
+can_start_primary_expression :: (ps: *Parse_State) -> bool {
+    kind := current(ps).kind;
+    return kind == .STRING_LITERAL ||
+           kind == .INT_LITERAL ||
+           kind == .FLOAT_LITERAL ||
+           kind == .IDENTIFIER ||
+           kind == .OPEN_PAREN ||
+           kind == .DOT ||
+           kind == .DOLLAR ||
+           kind == .HASH ||
+           kind == .CAST ||
+           kind == .OPEN_BRACE ||
+           kind == .OPEN_BRACKET;
+}
+
 is_lambda_after_open :: (ps: *Parse_State) -> bool {
     scan := ps.index;
     depth := 1;
@@ -1258,7 +1973,45 @@ is_lambda_after_open :: (ps: *Parse_State) -> bool {
         scan += 1;
     }
 
-    return depth == 0 && scan < ps.tokens.count && (ps.tokens[scan].kind == .ARROW || ps.tokens[scan].kind == .FAT_ARROW);
+    if depth != 0 || scan >= ps.tokens.count return false;
+    if ps.tokens[scan].kind == .ARROW || ps.tokens[scan].kind == .FAT_ARROW return true;
+    if ps.tokens[scan].kind == .OPEN_BRACE return is_lambda_parameter_list_ahead(ps);
+    if ps.tokens[scan].kind == .HASH {
+        while scan < ps.tokens.count && ps.tokens[scan].kind == .HASH {
+            scan += 1;
+            if scan < ps.tokens.count && ps.tokens[scan].kind == .IDENTIFIER scan += 1;
+            if scan < ps.tokens.count && ps.tokens[scan].kind == .OPEN_PAREN {
+                depth := 1;
+                scan += 1;
+                while scan < ps.tokens.count && depth > 0 {
+                    if ps.tokens[scan].kind == .OPEN_PAREN depth += 1;
+                    else if ps.tokens[scan].kind == .CLOSE_PAREN depth -= 1;
+                    scan += 1;
+                }
+            }
+        }
+
+        if scan < ps.tokens.count && ps.tokens[scan].kind == .OPEN_BRACE return is_lambda_parameter_list_ahead(ps);
+    }
+    return false;
+}
+
+is_lambda_parameter_list_ahead :: (ps: *Parse_State) -> bool {
+    scan := ps.index;
+    depth := 1;
+    saw_parameter_marker := false;
+
+    if check(ps, .CLOSE_PAREN) return true;
+
+    while scan < ps.tokens.count && depth > 0 {
+        kind := ps.tokens[scan].kind;
+        if kind == .OPEN_PAREN depth += 1;
+        else if kind == .CLOSE_PAREN depth -= 1;
+        else if depth == 1 && (kind == .COLON || kind == .COLON_EQUAL || kind == .USING || kind == .DOLLAR) saw_parameter_marker = true;
+        scan += 1;
+    }
+
+    return saw_parameter_marker;
 }
 
 parse_lambda_after_open :: (ps: *Parse_State, open: Token) -> *Node {
@@ -1275,7 +2028,10 @@ parse_lambda_after_open :: (ps: *Parse_State, open: Token) -> *Node {
     }
 
     expect(ps, .CLOSE_PAREN, "Expected ')' after lambda parameters");
-    if match(ps, .FAT_ARROW) {
+    skip_lambda_modifiers(ps);
+    if match(ps, .OPEN_BRACE) {
+        node.body = parse_block_after_open(ps, previous(ps));
+    } else if match(ps, .FAT_ARROW) {
         node.rhs = parse_expression(ps);
     } else {
         expect(ps, .ARROW, "Expected '->' after lambda parameters");
@@ -1284,6 +2040,13 @@ parse_lambda_after_open :: (ps: *Parse_State, open: Token) -> *Node {
         else node.rhs = parse_expression(ps);
     }
     return node;
+}
+
+skip_lambda_modifiers :: (ps: *Parse_State) {
+    while match(ps, .HASH) {
+        expect(ps, .IDENTIFIER, "Expected lambda modifier after '#'");
+        if match(ps, .OPEN_PAREN) skip_balanced_tokens(ps, .OPEN_PAREN, .CLOSE_PAREN);
+    }
 }
 
 parse_lambda_param :: (ps: *Parse_State) -> *Node {
@@ -1328,6 +2091,10 @@ parse_struct_literal_after_open :: (ps: *Parse_State, start_token: Token, type_e
                 entry.name = name.text;
                 expect(ps, .EQUAL, "Expected '=' after struct literal field name");
                 entry.rhs = parse_expression(ps);
+            } else if is_struct_literal_designator_ahead(ps) {
+                entry.lhs = parse_expression(ps);
+                expect(ps, .EQUAL, "Expected '=' after struct literal field designator");
+                entry.rhs = parse_expression(ps);
             } else {
                 entry.rhs = parse_expression(ps);
             }
@@ -1341,6 +2108,35 @@ parse_struct_literal_after_open :: (ps: *Parse_State, start_token: Token, type_e
 
     expect(ps, .CLOSE_BRACE, "Expected '}' after struct literal");
     return node;
+}
+
+is_struct_literal_designator_ahead :: (ps: *Parse_State) -> bool {
+    scan := ps.index;
+    paren_depth := 0;
+    bracket_depth := 0;
+    brace_depth := 0;
+
+    while scan < ps.tokens.count {
+        kind := ps.tokens[scan].kind;
+        if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
+            if kind == .EQUAL return true;
+            if kind == .COMMA || kind == .CLOSE_BRACE return false;
+        }
+
+        if kind == .OPEN_PAREN paren_depth += 1;
+        else if kind == .CLOSE_PAREN paren_depth -= 1;
+        else if kind == .OPEN_BRACKET bracket_depth += 1;
+        else if kind == .CLOSE_BRACKET bracket_depth -= 1;
+        else if kind == .OPEN_BRACE brace_depth += 1;
+        else if kind == .CLOSE_BRACE {
+            if brace_depth == 0 return false;
+            brace_depth -= 1;
+        }
+
+        scan += 1;
+    }
+
+    return false;
 }
 
 parse_function_type :: (ps: *Parse_State) -> *Node {
@@ -1359,11 +2155,12 @@ parse_function_type :: (ps: *Parse_State) -> *Node {
 
     expect(ps, .CLOSE_PAREN, "Expected ')' after function type parameters");
     if match(ps, .ARROW) node.return_type = parse_return_type(ps);
+    skip_type_suffix_directives(ps);
     return node;
 }
 
 parse_function_type_param :: (ps: *Parse_State) -> *Node {
-    if check(ps, .IDENTIFIER) && check_at(ps, 1, .COLON) return parse_param(ps);
+    if check(ps, .IDENTIFIER) && (check_at(ps, 1, .COLON) || check_at(ps, 1, .COLON_EQUAL)) return parse_param(ps);
     if check(ps, .USING) || check(ps, .DOLLAR) return parse_param(ps);
 
     node := new_node(.PARAM, current(ps).span);
@@ -1374,7 +2171,7 @@ parse_function_type_param :: (ps: *Parse_State) -> *Node {
 binary_precedence :: (kind: Token_Kind) -> int {
     if kind == .STAR || kind == .SLASH || kind == .PERCENT return 20;
     if kind == .PLUS || kind == .MINUS return 10;
-    if kind == .LESS_LESS || kind == .GREATER_GREATER return 9;
+    if kind == .LESS_LESS || kind == .GREATER_GREATER || kind == .LESS_LESS_LESS || kind == .GREATER_GREATER_GREATER return 9;
     if kind == .AMPERSAND return 8;
     if kind == .CARET return 7;
     if kind == .PIPE return 6;
@@ -1425,6 +2222,14 @@ match :: (ps: *Parse_State, kind: Token_Kind) -> bool {
 
 expect :: (ps: *Parse_State, kind: Token_Kind, message: string) -> Token {
     if check(ps, kind) return advance(ps);
+
+    token := current(ps);
+    set_error(ps, message, token.span);
+    return token;
+}
+
+expect_name_token :: (ps: *Parse_State, message: string) -> Token {
+    if check(ps, .IDENTIFIER) || check(ps, .INTERFACE) return advance(ps);
 
     token := current(ps);
     set_error(ps, message, token.span);

@@ -26,6 +26,7 @@ lex :: (input: string) -> Lexer_Result {
     lexer: Lexer;
     init(*lexer, input);
     result: Lexer_Result;
+    array_reserve(*result.tokens, input.count / 4);
 
     while !lexer.has_error {
         token := next_token(*lexer);
@@ -144,7 +145,9 @@ next_token :: (lexer: *Lexer) -> Token {
     }
     if c == #char "`" return consume_one_character_token(lexer, .BACKTICK);
     if c == #char "@" return consume_one_character_token(lexer, .AT);
+    if c == #char "?" return consume_one_character_token(lexer, .QUESTION);
     if c == #char "*" {
+        if lexer.position > 0 && lexer.source_code[lexer.position - 1] == #char "." && peek_at(lexer, 1) == #char "=" return consume_one_character_token(lexer, .STAR);
         if peek_at(lexer, 1) == #char "=" return consume_two_character_token(lexer, .STAR_EQUAL);
         return consume_one_character_token(lexer, .STAR);
     }
@@ -157,6 +160,7 @@ next_token :: (lexer: *Lexer) -> Token {
         return consume_one_character_token(lexer, .PERCENT);
     }
     if c == #char "&" {
+        if peek_at(lexer, 1) == #char "&" && peek_at(lexer, 2) == #char "=" return consume_three_character_token(lexer, .AND_AND_EQUAL);
         if peek_at(lexer, 1) == #char "&" return consume_two_character_token(lexer, .AND_AND);
         if peek_at(lexer, 1) == #char "=" return consume_two_character_token(lexer, .AMPERSAND_EQUAL);
         return consume_one_character_token(lexer, .AMPERSAND);
@@ -168,6 +172,7 @@ next_token :: (lexer: *Lexer) -> Token {
     }
 
     if c == #char "|" {
+        if peek_at(lexer, 1) == #char "|" && peek_at(lexer, 2) == #char "=" return consume_three_character_token(lexer, .OR_OR_EQUAL);
         if peek_at(lexer, 1) == #char "|" return consume_two_character_token(lexer, .OR_OR);
         if peek_at(lexer, 1) == #char "=" return consume_two_character_token(lexer, .PIPE_EQUAL);
         return consume_one_character_token(lexer, .PIPE);
@@ -187,6 +192,7 @@ next_token :: (lexer: *Lexer) -> Token {
 
     if c == #char "<" {
         if peek_at(lexer, 1) == #char "<" && peek_at(lexer, 2) == #char "=" return consume_three_character_token(lexer, .LESS_LESS_EQUAL);
+        if peek_at(lexer, 1) == #char "<" && peek_at(lexer, 2) == #char "<" return consume_three_character_token(lexer, .LESS_LESS_LESS);
         if peek_at(lexer, 1) == #char "<" return consume_two_character_token(lexer, .LESS_LESS);
         if peek_at(lexer, 1) == #char "=" return consume_two_character_token(lexer, .LESS_EQUAL);
         return consume_one_character_token(lexer, .LESS);
@@ -194,6 +200,7 @@ next_token :: (lexer: *Lexer) -> Token {
 
     if c == #char ">" {
         if peek_at(lexer, 1) == #char ">" && peek_at(lexer, 2) == #char "=" return consume_three_character_token(lexer, .GREATER_GREATER_EQUAL);
+        if peek_at(lexer, 1) == #char ">" && peek_at(lexer, 2) == #char ">" return consume_three_character_token(lexer, .GREATER_GREATER_GREATER);
         if peek_at(lexer, 1) == #char ">" return consume_two_character_token(lexer, .GREATER_GREATER);
         if peek_at(lexer, 1) == #char "=" return consume_two_character_token(lexer, .GREATER_EQUAL);
         return consume_one_character_token(lexer, .GREATER);
@@ -235,17 +242,27 @@ skip_whitespace_and_comments :: (lexer: *Lexer) {
         }
 
         if c == #char "/" && peek_at(lexer, 1) == #char "/" {
-            while remaining(lexer) > 0 && peek(lexer) != #char "\n"
-                advance(lexer);
+            start := lexer.position;
+            while lexer.position < lexer.source_code.count && lexer.source_code[lexer.position] != #char "\n"
+                lexer.position += 1;
+            lexer.column += lexer.position - start;
             continue;
         }
 
         if c == #char "/" && peek_at(lexer, 1) == #char "*" {
             advance_n(lexer, 2);
-            while remaining(lexer) > 0 {
+            depth := 1;
+            while remaining(lexer) > 0 && depth > 0 {
+                if peek(lexer) == #char "/" && peek_at(lexer, 1) == #char "*" {
+                    advance_n(lexer, 2);
+                    depth += 1;
+                    continue;
+                }
+
                 if peek(lexer) == #char "*" && peek_at(lexer, 1) == #char "/" {
                     advance_n(lexer, 2);
-                    break;
+                    depth -= 1;
+                    continue;
                 }
                 advance(lexer);
             }
@@ -338,11 +355,29 @@ consume_number_token :: (lexer: *Lexer) -> Token {
         return .{ kind = .INT_LITERAL, text = span_text(lexer.source_code, span), span = span };
     }
 
+    if peek(lexer) == #char "0" && (peek_at(lexer, 1) == #char "b" || peek_at(lexer, 1) == #char "B") {
+        advance_n(lexer, 2);
+        while remaining(lexer) > 0 && (peek(lexer) == #char "0" || peek(lexer) == #char "1" || peek(lexer) == #char "_")
+            advance(lexer);
+
+        span := make_span(start_position_in_input, lexer.position, start_line, start_column);
+        return .{ kind = .INT_LITERAL, text = span_text(lexer.source_code, span), span = span };
+    }
+
+    if peek(lexer) == #char "0" && (peek_at(lexer, 1) == #char "h" || peek_at(lexer, 1) == #char "H") {
+        advance_n(lexer, 2);
+        while remaining(lexer) > 0 && (is_hex_digit(peek(lexer)) || peek(lexer) == #char "_")
+            advance(lexer);
+
+        span := make_span(start_position_in_input, lexer.position, start_line, start_column);
+        return .{ kind = .FLOAT_LITERAL, text = span_text(lexer.source_code, span), span = span };
+    }
+
     while remaining(lexer) > 0 && (is_digit(peek(lexer)) || peek(lexer) == #char "_")
         advance(lexer);
 
     kind := Token_Kind.INT_LITERAL;
-    if remaining(lexer) > 0 && peek(lexer) == #char "." && is_digit(peek_at(lexer, 1)) {
+    if remaining(lexer) > 0 && peek(lexer) == #char "." && peek_at(lexer, 1) != #char "." {
         kind = .FLOAT_LITERAL;
         advance(lexer);
         while remaining(lexer) > 0 && (is_digit(peek(lexer)) || peek(lexer) == #char "_")
