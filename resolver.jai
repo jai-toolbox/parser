@@ -45,8 +45,14 @@ Resolver_File_Scope :: struct {
     scope: *Resolver_Scope;
 }
 
+Resolver_Directory_Scope :: struct {
+    path: string;
+    scope: *Resolver_Scope;
+}
+
 Resolver_Result :: struct {
     root_scope: *Resolver_Scope;
+    directory_scopes: [..] Resolver_Directory_Scope;
     file_scopes: [..] Resolver_File_Scope;
     symbols: [..] *Resolver_Symbol;
     references: [..] Resolver_Reference;
@@ -88,9 +94,11 @@ resolve_project_symbols :: (files: [] Resolver_Input_File) -> Resolver_Result {
 
     for file: files {
         if file.root == null || file.root.kind != .FILE continue;
+        directory_scope := get_or_create_directory_scope(*state, resolver_directory_for_path(file.path));
+
         file_scope: Resolver_File_Scope;
         file_scope.path = file.path;
-        file_scope.scope = new_resolver_scope(state.result.root_scope);
+        file_scope.scope = directory_scope;
         array_add(*state.result.file_scopes, file_scope);
 
         state.file_path = file.path;
@@ -124,9 +132,11 @@ resolve_project_symbols_for_file :: (files: [] Resolver_Input_File, target_path:
 
     for file: files {
         if file.root == null || file.root.kind != .FILE continue;
+        directory_scope := get_or_create_directory_scope(*state, resolver_directory_for_path(file.path));
+
         file_scope: Resolver_File_Scope;
         file_scope.path = file.path;
-        file_scope.scope = new_resolver_scope(state.result.root_scope);
+        file_scope.scope = directory_scope;
         array_add(*state.result.file_scopes, file_scope);
 
         state.file_path = file.path;
@@ -185,6 +195,42 @@ new_resolver_scope :: (parent: *Resolver_Scope) -> *Resolver_Scope {
     scope := New(Resolver_Scope);
     scope.parent = parent;
     return scope;
+}
+
+resolver_path_char_is_separator :: (c: u8) -> bool {
+    return c == #char "/" || c == #char "\\";
+}
+
+resolver_directory_for_path :: (path: string) -> string {
+    i := path.count - 1;
+    while i >= 0 {
+        if resolver_path_char_is_separator(path[i]) {
+            result: string;
+            result.data = path.data;
+            result.count = i;
+            return result;
+        }
+        i -= 1;
+    }
+    return "";
+}
+
+find_directory_scope :: (result: Resolver_Result, directory_path: string) -> *Resolver_Scope {
+    for directory_scope: result.directory_scopes {
+        if directory_scope.path == directory_path return directory_scope.scope;
+    }
+    return null;
+}
+
+get_or_create_directory_scope :: (state: *Resolver_State, directory_path: string) -> *Resolver_Scope {
+    existing := find_directory_scope(state.result, directory_path);
+    if existing != null return existing;
+
+    directory_scope: Resolver_Directory_Scope;
+    directory_scope.path = directory_path;
+    directory_scope.scope = new_resolver_scope(state.result.root_scope);
+    array_add(*state.result.directory_scopes, directory_scope);
+    return directory_scope.scope;
 }
 
 push_scope :: (state: *Resolver_State) {
