@@ -25,6 +25,96 @@ Parse_State :: struct {
     error_span    : Source_Span;
 }
 
+PARSER_PROFILE_ENABLED :: false;
+
+#if PARSER_PROFILE_ENABLED {
+Parser_Profile_Slot :: enum {
+    PARSE_TOKENS;
+    PARSE_FILE;
+    TOP_LEVEL_DECL;
+    FUNCTION;
+    STRUCT_DECL;
+    PARAM;
+    TYPE;
+    BLOCK;
+    STATEMENT;
+    EXPRESSION;
+    BINARY_EXPRESSION;
+    UNARY_EXPRESSION;
+    POSTFIX_EXPRESSION;
+    PRIMARY_EXPRESSION;
+    NEW_NODE;
+}
+
+PARSER_PROFILE_SLOT_COUNT :: 15;
+
+parser_profile_enabled := false;
+parser_profile_counts: [PARSER_PROFILE_SLOT_COUNT] int;
+parser_profile_seconds: [PARSER_PROFILE_SLOT_COUNT] float64;
+parser_profile_tokens_consumed: [PARSER_PROFILE_SLOT_COUNT] int;
+parser_profile_node_counts: [cast(int) Node_Kind.BINARY_EXPR + 1] int;
+
+parser_profile_slot_names: [PARSER_PROFILE_SLOT_COUNT] string = .[
+    "parse_tokens",
+    "parse_file",
+    "parse_top_level_declaration",
+    "parse_function",
+    "parse_struct_after_header",
+    "parse_param",
+    "parse_type",
+    "parse_block_after_open",
+    "parse_statement",
+    "parse_expression",
+    "parse_binary_expression",
+    "parse_unary_expression",
+    "parse_postfix_expression",
+    "parse_primary_expression",
+    "new_node",
+];
+
+parser_profile_reset :: () {
+    for i: 0..PARSER_PROFILE_SLOT_COUNT-1 {
+        parser_profile_counts[i] = 0;
+        parser_profile_seconds[i] = 0.0;
+        parser_profile_tokens_consumed[i] = 0;
+    }
+
+    for i: 0..parser_profile_node_counts.count-1 parser_profile_node_counts[i] = 0;
+}
+
+parser_profile_set_enabled :: (enabled: bool) {
+    parser_profile_enabled = enabled;
+}
+
+parser_profile_print :: () {
+    print("profile,function,calls,total_ms,avg_us,tokens_consumed\n");
+    for i: 0..PARSER_PROFILE_SLOT_COUNT-1 {
+        calls := parser_profile_counts[i];
+        if calls == 0 continue;
+
+        total_ms := parser_profile_seconds[i] * 1000.0;
+        avg_us := parser_profile_seconds[i] * 1000000.0 / cast(float64) calls;
+        print("profile,%,%,%,%,%\n", parser_profile_slot_names[i], calls, total_ms, avg_us, parser_profile_tokens_consumed[i]);
+    }
+
+    print("profile_nodes,kind,count\n");
+    for i: 0..parser_profile_node_counts.count-1 {
+        count := parser_profile_node_counts[i];
+        if count == 0 continue;
+        print("profile_nodes,%,%\n", cast(Node_Kind) i, count);
+    }
+}
+} else {
+parser_profile_reset :: () {
+}
+
+parser_profile_set_enabled :: (enabled: bool) {
+}
+
+parser_profile_print :: () {
+}
+}
+
 parse :: (input: string) -> Parse_Result {
     lex_result := lex(input);
     if !lex_result.success {
@@ -38,6 +128,15 @@ parse :: (input: string) -> Parse_Result {
 }
 
 parse_tokens :: (tokens: [] Token) -> Parse_Result {
+    #if PARSER_PROFILE_ENABLED {
+        profile_start := current_time_monotonic();
+        if parser_profile_enabled parser_profile_counts[cast(int) Parser_Profile_Slot.PARSE_TOKENS] += 1;
+        defer if parser_profile_enabled {
+            parser_profile_seconds[cast(int) Parser_Profile_Slot.PARSE_TOKENS] += to_float64_seconds(current_time_monotonic() - profile_start);
+            parser_profile_tokens_consumed[cast(int) Parser_Profile_Slot.PARSE_TOKENS] += tokens.count;
+        }
+    }
+
     ps: Parse_State;
     ps.tokens = tokens;
 
@@ -56,6 +155,16 @@ parse_tokens :: (tokens: [] Token) -> Parse_Result {
 }
 
 parse_file :: (ps: *Parse_State) -> *Node {
+    #if PARSER_PROFILE_ENABLED {
+        profile_start_index := ps.index;
+        profile_start := current_time_monotonic();
+        if parser_profile_enabled parser_profile_counts[cast(int) Parser_Profile_Slot.PARSE_FILE] += 1;
+        defer if parser_profile_enabled {
+            parser_profile_seconds[cast(int) Parser_Profile_Slot.PARSE_FILE] += to_float64_seconds(current_time_monotonic() - profile_start);
+            parser_profile_tokens_consumed[cast(int) Parser_Profile_Slot.PARSE_FILE] += ps.index - profile_start_index;
+        }
+    }
+
     root := new_node(.FILE, current(ps).span);
 
     while !check(ps, .EOF) && !ps.has_error {
@@ -229,6 +338,16 @@ skip_top_level_annotation :: (ps: *Parse_State) {
 }
 
 parse_top_level_declaration :: (ps: *Parse_State) -> *Node {
+    #if PARSER_PROFILE_ENABLED {
+        profile_start_index := ps.index;
+        profile_start := current_time_monotonic();
+        if parser_profile_enabled parser_profile_counts[cast(int) Parser_Profile_Slot.TOP_LEVEL_DECL] += 1;
+        defer if parser_profile_enabled {
+            parser_profile_seconds[cast(int) Parser_Profile_Slot.TOP_LEVEL_DECL] += to_float64_seconds(current_time_monotonic() - profile_start);
+            parser_profile_tokens_consumed[cast(int) Parser_Profile_Slot.TOP_LEVEL_DECL] += ps.index - profile_start_index;
+        }
+    }
+
     name_token := expect(ps, .IDENTIFIER, "Expected top-level declaration name");
 
     if name_token.text == "operator" return parse_operator_declaration_after_name(ps, name_token);
@@ -420,6 +539,16 @@ parse_global_group_typed_declaration_after_name :: (ps: *Parse_State, first_name
 }
 
 parse_function :: (ps: *Parse_State) -> *Node {
+    #if PARSER_PROFILE_ENABLED {
+        profile_start_index := ps.index;
+        profile_start := current_time_monotonic();
+        if parser_profile_enabled parser_profile_counts[cast(int) Parser_Profile_Slot.FUNCTION] += 1;
+        defer if parser_profile_enabled {
+            parser_profile_seconds[cast(int) Parser_Profile_Slot.FUNCTION] += to_float64_seconds(current_time_monotonic() - profile_start);
+            parser_profile_tokens_consumed[cast(int) Parser_Profile_Slot.FUNCTION] += ps.index - profile_start_index;
+        }
+    }
+
     name_token := expect(ps, .IDENTIFIER, "Expected function name");
     expect(ps, .COLON_COLON, "Expected '::' after function name");
     return parse_function_after_header(ps, name_token);
@@ -476,6 +605,16 @@ skip_function_body_directives :: (ps: *Parse_State) -> bool {
 }
 
 parse_struct_after_header :: (ps: *Parse_State, name_token: Token) -> *Node {
+    #if PARSER_PROFILE_ENABLED {
+        profile_start_index := ps.index;
+        profile_start := current_time_monotonic();
+        if parser_profile_enabled parser_profile_counts[cast(int) Parser_Profile_Slot.STRUCT_DECL] += 1;
+        defer if parser_profile_enabled {
+            parser_profile_seconds[cast(int) Parser_Profile_Slot.STRUCT_DECL] += to_float64_seconds(current_time_monotonic() - profile_start);
+            parser_profile_tokens_consumed[cast(int) Parser_Profile_Slot.STRUCT_DECL] += ps.index - profile_start_index;
+        }
+    }
+
     node := new_node(.STRUCT_DECL, name_token.span);
     node.name = name_token.text;
 
@@ -696,6 +835,16 @@ parse_using_struct_field :: (ps: *Parse_State, using_token: Token) -> *Node {
 }
 
 parse_param :: (ps: *Parse_State) -> *Node {
+    #if PARSER_PROFILE_ENABLED {
+        profile_start_index := ps.index;
+        profile_start := current_time_monotonic();
+        if parser_profile_enabled parser_profile_counts[cast(int) Parser_Profile_Slot.PARAM] += 1;
+        defer if parser_profile_enabled {
+            parser_profile_seconds[cast(int) Parser_Profile_Slot.PARAM] += to_float64_seconds(current_time_monotonic() - profile_start);
+            parser_profile_tokens_consumed[cast(int) Parser_Profile_Slot.PARAM] += ps.index - profile_start_index;
+        }
+    }
+
     match(ps, .USING);
     skip_param_modifiers(ps);
 
@@ -728,6 +877,16 @@ skip_param_modifiers :: (ps: *Parse_State) {
 }
 
 parse_type :: (ps: *Parse_State) -> *Node {
+    #if PARSER_PROFILE_ENABLED {
+        profile_start_index := ps.index;
+        profile_start := current_time_monotonic();
+        if parser_profile_enabled parser_profile_counts[cast(int) Parser_Profile_Slot.TYPE] += 1;
+        defer if parser_profile_enabled {
+            parser_profile_seconds[cast(int) Parser_Profile_Slot.TYPE] += to_float64_seconds(current_time_monotonic() - profile_start);
+            parser_profile_tokens_consumed[cast(int) Parser_Profile_Slot.TYPE] += ps.index - profile_start_index;
+        }
+    }
+
     if match(ps, .HASH) {
         hash := previous(ps);
         name := expect(ps, .IDENTIFIER, "Expected type directive name after '#'");
@@ -954,6 +1113,16 @@ parse_block :: (ps: *Parse_State) -> *Node {
 }
 
 parse_block_after_open :: (ps: *Parse_State, open: Token) -> *Node {
+    #if PARSER_PROFILE_ENABLED {
+        profile_start_index := ps.index;
+        profile_start := current_time_monotonic();
+        if parser_profile_enabled parser_profile_counts[cast(int) Parser_Profile_Slot.BLOCK] += 1;
+        defer if parser_profile_enabled {
+            parser_profile_seconds[cast(int) Parser_Profile_Slot.BLOCK] += to_float64_seconds(current_time_monotonic() - profile_start);
+            parser_profile_tokens_consumed[cast(int) Parser_Profile_Slot.BLOCK] += ps.index - profile_start_index;
+        }
+    }
+
     block := new_node(.BLOCK, open.span);
 
     while !check(ps, .CLOSE_BRACE) && !check(ps, .EOF) && !ps.has_error {
@@ -966,6 +1135,16 @@ parse_block_after_open :: (ps: *Parse_State, open: Token) -> *Node {
 }
 
 parse_statement :: (ps: *Parse_State) -> *Node {
+    #if PARSER_PROFILE_ENABLED {
+        profile_start_index := ps.index;
+        profile_start := current_time_monotonic();
+        if parser_profile_enabled parser_profile_counts[cast(int) Parser_Profile_Slot.STATEMENT] += 1;
+        defer if parser_profile_enabled {
+            parser_profile_seconds[cast(int) Parser_Profile_Slot.STATEMENT] += to_float64_seconds(current_time_monotonic() - profile_start);
+            parser_profile_tokens_consumed[cast(int) Parser_Profile_Slot.STATEMENT] += ps.index - profile_start_index;
+        }
+    }
+
     if match(ps, .SEMICOLON) return null;
     if match(ps, .AT) {
         skip_top_level_annotation(ps);
@@ -1563,6 +1742,16 @@ parse_local_group_decl :: (ps: *Parse_State) -> *Node {
 }
 
 parse_expression :: (ps: *Parse_State) -> *Node {
+    #if PARSER_PROFILE_ENABLED {
+        profile_start_index := ps.index;
+        profile_start := current_time_monotonic();
+        if parser_profile_enabled parser_profile_counts[cast(int) Parser_Profile_Slot.EXPRESSION] += 1;
+        defer if parser_profile_enabled {
+            parser_profile_seconds[cast(int) Parser_Profile_Slot.EXPRESSION] += to_float64_seconds(current_time_monotonic() - profile_start);
+            parser_profile_tokens_consumed[cast(int) Parser_Profile_Slot.EXPRESSION] += ps.index - profile_start_index;
+        }
+    }
+
     if check(ps, .IDENTIFIER) && check_at(ps, 1, .FAT_ARROW) return parse_single_name_lambda(ps);
     return parse_binary_expression(ps, 0);
 }
@@ -1599,6 +1788,16 @@ parse_expression_list :: (ps: *Parse_State) -> *Node {
 }
 
 parse_binary_expression :: (ps: *Parse_State, min_precedence: int) -> *Node {
+    #if PARSER_PROFILE_ENABLED {
+        profile_start_index := ps.index;
+        profile_start := current_time_monotonic();
+        if parser_profile_enabled parser_profile_counts[cast(int) Parser_Profile_Slot.BINARY_EXPRESSION] += 1;
+        defer if parser_profile_enabled {
+            parser_profile_seconds[cast(int) Parser_Profile_Slot.BINARY_EXPRESSION] += to_float64_seconds(current_time_monotonic() - profile_start);
+            parser_profile_tokens_consumed[cast(int) Parser_Profile_Slot.BINARY_EXPRESSION] += ps.index - profile_start_index;
+        }
+    }
+
     left := parse_unary_expression(ps);
 
     while !ps.has_error {
@@ -1620,6 +1819,16 @@ parse_binary_expression :: (ps: *Parse_State, min_precedence: int) -> *Node {
 }
 
 parse_unary_expression :: (ps: *Parse_State) -> *Node {
+    #if PARSER_PROFILE_ENABLED {
+        profile_start_index := ps.index;
+        profile_start := current_time_monotonic();
+        if parser_profile_enabled parser_profile_counts[cast(int) Parser_Profile_Slot.UNARY_EXPRESSION] += 1;
+        defer if parser_profile_enabled {
+            parser_profile_seconds[cast(int) Parser_Profile_Slot.UNARY_EXPRESSION] += to_float64_seconds(current_time_monotonic() - profile_start);
+            parser_profile_tokens_consumed[cast(int) Parser_Profile_Slot.UNARY_EXPRESSION] += ps.index - profile_start_index;
+        }
+    }
+
     if match(ps, .XX) {
         op := previous(ps);
         while match(ps, .COMMA) {
@@ -1644,6 +1853,16 @@ parse_unary_expression :: (ps: *Parse_State) -> *Node {
 }
 
 parse_postfix_expression :: (ps: *Parse_State) -> *Node {
+    #if PARSER_PROFILE_ENABLED {
+        profile_start_index := ps.index;
+        profile_start := current_time_monotonic();
+        if parser_profile_enabled parser_profile_counts[cast(int) Parser_Profile_Slot.POSTFIX_EXPRESSION] += 1;
+        defer if parser_profile_enabled {
+            parser_profile_seconds[cast(int) Parser_Profile_Slot.POSTFIX_EXPRESSION] += to_float64_seconds(current_time_monotonic() - profile_start);
+            parser_profile_tokens_consumed[cast(int) Parser_Profile_Slot.POSTFIX_EXPRESSION] += ps.index - profile_start_index;
+        }
+    }
+
     expr := parse_primary_expression(ps);
 
     while !ps.has_error {
@@ -1739,6 +1958,16 @@ parse_call_argument :: (ps: *Parse_State) -> *Node {
 }
 
 parse_primary_expression :: (ps: *Parse_State) -> *Node {
+    #if PARSER_PROFILE_ENABLED {
+        profile_start_index := ps.index;
+        profile_start := current_time_monotonic();
+        if parser_profile_enabled parser_profile_counts[cast(int) Parser_Profile_Slot.PRIMARY_EXPRESSION] += 1;
+        defer if parser_profile_enabled {
+            parser_profile_seconds[cast(int) Parser_Profile_Slot.PRIMARY_EXPRESSION] += to_float64_seconds(current_time_monotonic() - profile_start);
+            parser_profile_tokens_consumed[cast(int) Parser_Profile_Slot.PRIMARY_EXPRESSION] += ps.index - profile_start_index;
+        }
+    }
+
     if match(ps, .IFX) {
         ifx_token := previous(ps);
         node := new_node(.IFX_EXPR, ifx_token.span);
@@ -2183,6 +2412,17 @@ binary_precedence :: (kind: Token_Kind) -> int {
 }
 
 new_node :: (kind: Node_Kind, span: Source_Span) -> *Node {
+    #if PARSER_PROFILE_ENABLED {
+        profile_start := current_time_monotonic();
+        if parser_profile_enabled {
+            parser_profile_counts[cast(int) Parser_Profile_Slot.NEW_NODE] += 1;
+            parser_profile_node_counts[cast(int) kind] += 1;
+        }
+        defer if parser_profile_enabled {
+            parser_profile_seconds[cast(int) Parser_Profile_Slot.NEW_NODE] += to_float64_seconds(current_time_monotonic() - profile_start);
+        }
+    }
+
     node := New(Node);
     node.kind = kind;
     node.span = span;
@@ -2209,12 +2449,12 @@ check_at :: inline (ps: *Parse_State, ahead: int, kind: Token_Kind) -> bool {
     return ps.tokens[idx].kind == kind;
 }
 
-advance :: (ps: *Parse_State) -> Token {
+advance :: inline (ps: *Parse_State) -> Token {
     if !check(ps, .EOF) ps.index += 1;
     return previous(ps);
 }
 
-match :: (ps: *Parse_State, kind: Token_Kind) -> bool {
+match :: inline (ps: *Parse_State, kind: Token_Kind) -> bool {
     if !check(ps, kind) return false;
     advance(ps);
     return true;

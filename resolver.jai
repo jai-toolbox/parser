@@ -126,6 +126,12 @@ resolve_project_symbols :: (files: [] Resolver_Input_File) -> Resolver_Result {
 }
 
 resolve_project_symbols_for_file :: (files: [] Resolver_Input_File, target_path: string) -> Resolver_Result {
+    target_paths: [..] string;
+    array_add(*target_paths, target_path);
+    return resolve_project_symbols_for_files(files, target_paths);
+}
+
+resolve_project_symbols_for_files :: (files: [] Resolver_Input_File, target_paths: [] string) -> Resolver_Result {
     state: Resolver_State;
     state.result.root_scope = new_resolver_scope(null);
     state.current_scope = state.result.root_scope;
@@ -149,7 +155,7 @@ resolve_project_symbols_for_file :: (files: [] Resolver_Input_File, target_path:
     }
 
     for file: files {
-        if file.path != target_path continue;
+        if !path_is_in_resolver_list(file.path, target_paths) continue;
         if file.root == null || file.root.kind != .FILE continue;
         file_scope := find_file_scope(state.result, file.path);
         if file_scope == null continue;
@@ -160,10 +166,17 @@ resolve_project_symbols_for_file :: (files: [] Resolver_Input_File, target_path:
             resolve_top_level_declaration(*state, declaration);
         }
 
-        break;
     }
 
     return state.result;
+}
+
+path_is_in_resolver_list :: (path: string, paths: [] string) -> bool {
+    for candidate: paths {
+        if candidate == path return true;
+    }
+
+    return false;
 }
 
 export_file_scope_declarations_to_project :: (state: *Resolver_State, root: *Node, file_scope: *Resolver_Scope) {
@@ -561,7 +574,31 @@ resolve_expression :: (state: *Resolver_State, expression: *Node) {
     }
 }
 
+is_builtin_type_name :: (name: string) -> bool {
+    if name == "void" return true;
+    if name == "bool" return true;
+    if name == "string" return true;
+    if name == "int" return true;
+    if name == "s8" return true;
+    if name == "s16" return true;
+    if name == "s32" return true;
+    if name == "s64" return true;
+    if name == "u8" return true;
+    if name == "u16" return true;
+    if name == "u32" return true;
+    if name == "u64" return true;
+    if name == "float" return true;
+    if name == "float32" return true;
+    if name == "float64" return true;
+    if name == "sized_int" return true;
+    if name == "type" return true;
+    if name == "Any" return true;
+    return false;
+}
+
 resolve_type_reference :: (state: *Resolver_State, type_node: *Node) {
+    if type_node == null return;
+    if type_node.kind == .TYPE_NAME && is_builtin_type_name(type_node.name) return;
     resolve_expression(state, type_node);
 }
 

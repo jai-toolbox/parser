@@ -319,26 +319,55 @@ consume_identifier_or_keyword_token :: (lexer: *Lexer) -> Token {
 
     span := make_span(start_position_in_input, lexer.position, start_line, start_column);
     text := span_text(lexer.source_code, span);
-    kind := Token_Kind.IDENTIFIER;
-
-    if text == "return" kind = .RETURN;
-    else if text == "if" kind = .IF;
-    else if text == "ifx" kind = .IFX;
-    else if text == "then" kind = .THEN;
-    else if text == "for" kind = .FOR;
-    else if text == "while" kind = .WHILE;
-    else if text == "defer" kind = .DEFER;
-    else if text == "else" kind = .ELSE;
-    else if text == "struct" kind = .STRUCT;
-    else if text == "union" kind = .UNION;
-    else if text == "enum" kind = .ENUM;
-    else if text == "enum_flags" kind = .ENUM_FLAGS;
-    else if text == "cast" kind = .CAST;
-    else if text == "interface" kind = .INTERFACE;
-    else if text == "using" kind = .USING;
-    else if text == "xx" kind = .XX;
+    kind := keyword_kind(text);
 
     return .{ kind = kind, text = text, span = span };
+}
+
+keyword_kind :: inline (text: string) -> Token_Kind {
+    if text.count < 2 return .IDENTIFIER;
+
+    if text.count == 2 {
+        if text[0] == #char "i" && text[1] == #char "f" return .IF;
+        if text[0] == #char "x" && text[1] == #char "x" return .XX;
+        return .IDENTIFIER;
+    }
+
+    if text.count == 3 {
+        if text[0] == #char "f" && text == "for" return .FOR;
+        if text[0] == #char "i" && text == "ifx" return .IFX;
+        return .IDENTIFIER;
+    }
+
+    if text.count == 4 {
+        if text[0] == #char "c" && text == "cast" return .CAST;
+        if text[0] == #char "e" && text == "else" return .ELSE;
+        if text[0] == #char "e" && text == "enum" return .ENUM;
+        if text[0] == #char "t" && text == "then" return .THEN;
+        return .IDENTIFIER;
+    }
+
+    if text.count == 5 {
+        if text[0] == #char "d" && text == "defer" return .DEFER;
+        if text[0] == #char "u" && text == "union" return .UNION;
+        if text[0] == #char "u" && text == "using" return .USING;
+        if text[0] == #char "w" && text == "while" return .WHILE;
+        return .IDENTIFIER;
+    }
+
+    if text.count == 6 {
+        if text[0] == #char "r" && text == "return" return .RETURN;
+        if text[0] == #char "s" && text == "struct" return .STRUCT;
+        return .IDENTIFIER;
+    }
+
+    if text.count == 10 {
+        if text[0] == #char "e" && text == "enum_flags" return .ENUM_FLAGS;
+        if text[0] == #char "i" && text == "interface" return .INTERFACE;
+        return .IDENTIFIER;
+    }
+
+    return .IDENTIFIER;
 }
 
 consume_number_token :: (lexer: *Lexer) -> Token {
