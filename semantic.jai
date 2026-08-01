@@ -396,6 +396,9 @@ resolve_binary_type :: (state: *Semantic_State, lhs_type: Resolved_Type, rhs_typ
 
     if same_type(lhs_type, rhs_type) return lhs_type;
 
+    if op == .STAR && is_named_type(lhs_type, "Matrix4") && is_named_type(rhs_type, "Vector4") return rhs_type;
+    if op == .STAR && is_named_type(lhs_type, "Matrix4") && is_named_type(rhs_type, "Matrix4") return lhs_type;
+
     if is_named_type(lhs_type, "Vector3") && is_named_type(rhs_type, "float32") return lhs_type;
     if is_named_type(lhs_type, "float32") && is_named_type(rhs_type, "Vector3") return rhs_type;
 
