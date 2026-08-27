@@ -105,6 +105,8 @@ Lexer_Result :: struct {
     tokens  : [..] Token;
     success : bool;
     error   : Error;
+    errors  : [64] Error;
+    error_count : int;
 }
 
 Node_Kind :: enum {
@@ -160,6 +162,12 @@ Node_Kind :: enum {
     LAMBDA_EXPR;
     UNARY_EXPR;
     BINARY_EXPR;
+
+    // Error nodes retain the source range consumed while recovering from an
+    // incomplete edit.  Semantic consumers deliberately ignore the node, but
+    // its siblings remain available in the partial tree. Keep this last so
+    // existing serialized/default enum values remain stable.
+    ERROR;
 }
 
 Node :: struct {
@@ -169,6 +177,8 @@ Node :: struct {
     name : string;
     literal : string;
     op : Token_Kind;
+    is_using : bool;
+    using_exceptions : [..] string;
 
     type_node : *Node;
     return_type : *Node;
@@ -180,6 +190,7 @@ Node :: struct {
     params : [..] *Node;
     statements : [..] *Node;
     args : [..] *Node;
+    implicit_arg_start : int = -1;
     declarations : [..] *Node;
 }
 
@@ -187,4 +198,6 @@ Parse_Result :: struct {
     root    : *Node;
     success : bool;
     error   : Error;
+    errors  : [64] Error;
+    error_count : int;
 }

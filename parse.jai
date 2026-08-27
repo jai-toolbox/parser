@@ -23,6 +23,8 @@ Parse_State :: struct {
     has_error     : bool;
     error_message : string;
     error_span    : Source_Span;
+    errors        : [64] Error;
+    error_count   : int;
 }
 
 PARSER_PROFILE_ENABLED :: false;
@@ -52,7 +54,7 @@ parser_profile_enabled := false;
 parser_profile_counts: [PARSER_PROFILE_SLOT_COUNT] int;
 parser_profile_seconds: [PARSER_PROFILE_SLOT_COUNT] float64;
 parser_profile_tokens_consumed: [PARSER_PROFILE_SLOT_COUNT] int;
-parser_profile_node_counts: [cast(int) Node_Kind.BINARY_EXPR + 1] int;
+parser_profile_node_counts: [cast(int) Node_Kind.ERROR + 1] int;
 
 parser_profile_slot_names: [PARSER_PROFILE_SLOT_COUNT] string = .[
     "parse_tokens",
@@ -117,14 +119,20 @@ parser_profile_print :: () {
 
 parse :: (input: string) -> Parse_Result {
     lex_result := lex(input);
-    if !lex_result.success {
-        result: Parse_Result;
-        result.success = false;
-        result.error = lex_result.error;
-        return result;
-    }
+    result := parse_tokens(lex_result.tokens);
+    array_free(lex_result.tokens);
 
-    return parse_tokens(lex_result.tokens);
+    // Lexing and parsing diagnostics are independent of tree availability.
+    // An invalid token or unfinished string must not discard the syntax tree
+    // built from the remainder of the current editor revision.
+    if !lex_result.success {
+        for i: 0..lex_result.error_count-1 {
+            if i >= lex_result.errors.count break;
+            parse_result_add_error(*result, lex_result.errors[i]);
+        }
+    }
+    result.success = result.error_count == 0;
+    return result;
 }
 
 parse_tokens :: (tokens: [] Token) -> Parse_Result {
@@ -143,15 +151,24 @@ parse_tokens :: (tokens: [] Token) -> Parse_Result {
     root := parse_file(*ps);
 
     result: Parse_Result;
-    if ps.has_error {
-        result.success = false;
-        result.error = .{ message = ps.error_message, span = ps.error_span };
-        return result;
-    }
-
     result.root = root;
-    result.success = true;
+    result.error_count = ps.error_count;
+    copy_count := min(ps.error_count, result.errors.count);
+    if copy_count > 0 {
+        for i: 0..copy_count-1 result.errors[i] = ps.errors[i];
+        result.error = result.errors[0];
+    }
+    result.success = result.error_count == 0;
     return result;
+}
+
+parse_result_add_error :: (result: *Parse_Result, error: Error) {
+    if result.error_count == 0 || error.span.start_position_in_input < result.error.span.start_position_in_input {
+        result.error = error;
+    }
+    if result.error_count < result.errors.count result.errors[result.error_count] = error;
+    result.error_count += 1;
+    result.success = false;
 }
 
 parse_file :: (ps: *Parse_State) -> *Node {
@@ -167,8 +184,29 @@ parse_file :: (ps: *Parse_State) -> *Node {
 
     root := new_node(.FILE, current(ps).span);
 
-    while !check(ps, .EOF) && !ps.has_error {
+    parse_top_level_items(ps, root);
+    return root;
+}
+
+parse_top_level_items :: (ps: *Parse_State, root: *Node, stop_at_close_brace := false) {
+    while !check(ps, .EOF) {
+        if ps.has_error {
+            error_node := parser_recover_pending_error(ps, ps.index, top_level = true);
+            if error_node array_add(*root.statements, error_node);
+            continue;
+        }
+        if stop_at_close_brace && check(ps, .CLOSE_BRACE) return;
+
         if match(ps, .HASH) {
+            hash_token := previous(ps);
+            if !check(ps, .EOF) && current(ps).text == "if" {
+                parse_top_level_if_directive(ps, root, hash_token);
+                continue;
+            }
+            if !check(ps, .EOF) && current(ps).text == "module_parameters" {
+                parse_top_level_module_parameters(ps, root);
+                continue;
+            }
             skip_top_level_compiler_directive(ps);
             continue;
         }
@@ -198,8 +236,105 @@ parse_file :: (ps: *Parse_State) -> *Node {
         decl := parse_top_level_declaration(ps);
         if decl array_add(*root.declarations, decl);
     }
+}
 
-    return root;
+parse_top_level_module_parameters :: (ps: *Parse_State, root: *Node) {
+    name := expect(ps, .IDENTIFIER, "Expected 'module_parameters' after '#'");
+    if name.text != "module_parameters" {
+        set_error(ps, "Expected '#module_parameters'", name.span);
+        return;
+    }
+
+    // Module parameters are file-scope declarations. Their defaults may refer
+    // to declarations in the optional body (for example Render_API.OPENGL), so
+    // retain both the parameter lists and the body in the same file syntax tree.
+    while match(ps, .OPEN_PAREN) {
+        if !check(ps, .CLOSE_PAREN) {
+            while !ps.has_error {
+                param := parse_param(ps);
+                if param != null {
+                    param.kind = ifx param.type_node != null then .GLOBAL_TYPED_DECL else .CONST_DECL;
+                    array_add(*root.declarations, param);
+                }
+
+                if !match(ps, .COMMA) break;
+                if check(ps, .CLOSE_PAREN) break;
+            }
+        }
+        expect(ps, .CLOSE_PAREN, "Expected ')' after #module_parameters list");
+    }
+
+    if match(ps, .OPEN_BRACE) {
+        parse_top_level_items(ps, root, stop_at_close_brace = true);
+        expect(ps, .CLOSE_BRACE, "Expected '}' after #module_parameters body");
+    }
+    match(ps, .SEMICOLON);
+}
+
+parse_top_level_if_directive :: (ps: *Parse_State, root: *Node, hash_token: Token) {
+    if check(ps, .EOF) || current(ps).text != "if" {
+        skip_top_level_compiler_directive(ps);
+        return;
+    }
+    advance(ps);
+
+    // Jai also uses `#if value == { case ... }` as a compile-time switch.
+    // Its brace contains case directives rather than declarations, so keep
+    // treating that form as an opaque directive body.
+    if top_level_if_is_switch_form(ps) {
+        while !check(ps, .OPEN_BRACE) && !check(ps, .SEMICOLON) && !check(ps, .EOF) && !ps.has_error {
+            advance(ps);
+        }
+        advance(ps);
+        skip_balanced_tokens(ps, .OPEN_BRACE, .CLOSE_BRACE);
+        match(ps, .SEMICOLON);
+        return;
+    }
+
+    // Retain the condition in the syntax tree even though declarations from
+    // both branches are flattened into the file. This lets semantic clients
+    // classify compiler constants and enum members inside the `#if` itself.
+    directive := new_node(.COMPILER_DIRECTIVE_STATEMENT, hash_token.span);
+    directive.name = "if";
+    directive.lhs = parse_expression(ps);
+    array_add(*root.statements, directive);
+
+    if !match(ps, .OPEN_BRACE) {
+        match(ps, .SEMICOLON);
+        return;
+    }
+
+    parse_top_level_items(ps, root, stop_at_close_brace = true);
+    expect(ps, .CLOSE_BRACE, "Expected '}' after top-level #if body");
+
+    if !match(ps, .ELSE) return;
+    if match(ps, .HASH) {
+        parse_top_level_if_directive(ps, root, previous(ps));
+        return;
+    }
+
+    while !check(ps, .OPEN_BRACE) && !check(ps, .SEMICOLON) && !check(ps, .EOF) && !ps.has_error {
+        advance(ps);
+    }
+    if match(ps, .OPEN_BRACE) {
+        parse_top_level_items(ps, root, stop_at_close_brace = true);
+        expect(ps, .CLOSE_BRACE, "Expected '}' after top-level #if else body");
+    } else {
+        match(ps, .SEMICOLON);
+    }
+}
+
+top_level_if_is_switch_form :: (ps: *Parse_State) -> bool {
+    scan := ps.index;
+    while scan < ps.tokens.count {
+        kind := ps.tokens[scan].kind;
+        if kind == .OPEN_BRACE {
+            return scan > ps.index && ps.tokens[scan - 1].kind == .EQUAL_EQUAL;
+        }
+        if kind == .SEMICOLON || kind == .EOF return false;
+        scan += 1;
+    }
+    return false;
 }
 
 skip_top_level_compiler_directive :: (ps: *Parse_State) {
@@ -437,11 +572,33 @@ parse_enum_after_header :: (ps: *Parse_State, name_token: Token) -> *Node {
     open := expect(ps, .OPEN_BRACE, "Expected '{' before enum body");
     node.body = new_node(.BLOCK, open.span);
 
-    while !check(ps, .CLOSE_BRACE) && !check(ps, .EOF) && !ps.has_error {
+    while !check(ps, .CLOSE_BRACE) && !check(ps, .EOF) {
+        if ps.has_error {
+            error_node := parser_recover_pending_error(ps, ps.index);
+            if error_node array_add(*node.declarations, error_node);
+            continue;
+        }
         if check(ps, .IDENTIFIER) {
             value := advance(ps);
             if match(ps, .COLON_COLON) {
-                skip_enum_scoped_declaration(ps);
+                // Jai's explicit enum values use `NAME :: expression` (the
+                // built-in Allocator_Mode is one example).  Only actual
+                // enum-scoped type/procedure declarations should be skipped.
+                if (check(ps, .OPEN_PAREN) && is_function_header_ahead(ps)) ||
+                   check(ps, .STRUCT) || check(ps, .UNION) ||
+                   check(ps, .ENUM) || check(ps, .ENUM_FLAGS) {
+                    skip_enum_scoped_declaration(ps);
+                    continue;
+                }
+
+                entry := new_node(.CONST_DECL, value.span);
+                entry.name = value.text;
+                if !check(ps, .SEMICOLON) && !check(ps, .COMMA) && !check(ps, .CLOSE_BRACE) {
+                    entry.rhs = parse_expression(ps);
+                }
+                array_add(*node.declarations, entry);
+                match(ps, .SEMICOLON);
+                match(ps, .COMMA);
                 continue;
             }
 
@@ -574,15 +731,16 @@ parse_function_after_header :: (ps: *Parse_State, name_token: Token) -> *Node {
     if match(ps, .ARROW) {
         fn.return_type = parse_return_type(ps);
     }
-    if !skip_function_body_directives(ps) return fn;
+    if !parse_function_body_directives(ps, fn) return fn;
     if match(ps, .SEMICOLON) return fn;
     fn.body = parse_block(ps);
     match(ps, .SEMICOLON);
     return fn;
 }
 
-skip_function_body_directives :: (ps: *Parse_State) -> bool {
+parse_function_body_directives :: (ps: *Parse_State, fn: *Node) -> bool {
     while match(ps, .HASH) {
+        hash_token := previous(ps);
         start_line := previous(ps).span.line;
         directive_name := "";
         if check(ps, .IDENTIFIER) {
@@ -597,7 +755,10 @@ skip_function_body_directives :: (ps: *Parse_State) -> bool {
         }
 
         if directive_name == "modify" && match(ps, .OPEN_BRACE) {
-            skip_balanced_tokens(ps, .OPEN_BRACE, .CLOSE_BRACE);
+            directive := new_node(.COMPILER_DIRECTIVE_STATEMENT, hash_token.span);
+            directive.name = directive_name;
+            directive.body = parse_block_after_open(ps, previous(ps));
+            array_add(*fn.statements, directive);
         }
     }
 
@@ -619,12 +780,26 @@ parse_struct_after_header :: (ps: *Parse_State, name_token: Token) -> *Node {
     node.name = name_token.text;
 
     if match(ps, .OPEN_PAREN) {
-        skip_balanced_tokens(ps, .OPEN_PAREN, .CLOSE_PAREN);
+        if !check(ps, .CLOSE_PAREN) {
+            while !ps.has_error {
+                param := parse_param(ps);
+                if param array_add(*node.params, param);
+
+                if !match(ps, .COMMA) break;
+                if check(ps, .CLOSE_PAREN) break;
+            }
+        }
+        expect(ps, .CLOSE_PAREN, "Expected ')' after struct parameter list");
     }
 
     skip_struct_header_directives(ps);
     expect(ps, .OPEN_BRACE, "Expected '{' before struct body");
-    while !check(ps, .CLOSE_BRACE) && !check(ps, .EOF) && !ps.has_error {
+    while !check(ps, .CLOSE_BRACE) && !check(ps, .EOF) {
+        if ps.has_error {
+            error_node := parser_recover_pending_error(ps, ps.index);
+            if error_node array_add(*node.declarations, error_node);
+            continue;
+        }
         if match(ps, .STRUCT) || match(ps, .UNION) {
             nested := parse_struct_after_header(ps, previous(ps));
             if nested array_add(*node.declarations, nested);
@@ -642,8 +817,15 @@ parse_struct_after_header :: (ps: *Parse_State, name_token: Token) -> *Node {
             continue;
         }
 
+        if check(ps, .HASH) && check_at(ps, 1, .IDENTIFIER) && ps.tokens[ps.index + 1].text == "overlay" {
+            field := parse_overlay_struct_field(ps);
+            if field array_add(*node.declarations, field);
+            continue;
+        }
+
         if match(ps, .HASH) {
-            skip_struct_compiler_directive(ps);
+            directive := parse_compiler_directive_statement(ps, previous(ps));
+            if directive array_add(*node.declarations, directive);
             continue;
         }
 
@@ -783,6 +965,38 @@ skip_struct_annotation :: (ps: *Parse_State) {
     }
 }
 
+parse_overlay_struct_field :: (ps: *Parse_State) -> *Node {
+    expect(ps, .HASH, "Expected '#overlay' in struct field");
+    overlay_name := expect(ps, .IDENTIFIER, "Expected 'overlay' after '#'");
+    if overlay_name.text != "overlay" {
+        set_error(ps, "Expected '#overlay' in struct field", overlay_name.span);
+        return null;
+    }
+
+    expect(ps, .OPEN_PAREN, "Expected '(' after '#overlay'");
+    target := parse_expression(ps);
+    expect(ps, .CLOSE_PAREN, "Expected ')' after #overlay target");
+
+    field: *Node;
+    if match(ps, .USING) {
+        field = parse_using_struct_field(ps, previous(ps));
+    } else if check(ps, .HASH) && check_at(ps, 1, .IDENTIFIER) && ps.tokens[ps.index + 1].text == "as" {
+        field = parse_hash_as_using_struct_field(ps);
+    } else {
+        name_token := expect_name_token(ps, "Expected overlaid struct field name");
+        expect(ps, .COLON, "Expected ':' after overlaid struct field name");
+
+        field = new_node(.STRUCT_FIELD, name_token.span);
+        field.name = name_token.text;
+        field.type_node = parse_type(ps);
+        if match(ps, .EQUAL) field.rhs = parse_expression(ps);
+        match(ps, .SEMICOLON);
+    }
+
+    if field != null field.lhs = target;
+    return field;
+}
+
 parse_hash_as_using_struct_field :: (ps: *Parse_State) -> *Node {
     hash := expect(ps, .HASH, "Expected '#as' in using struct field");
     as_name := expect(ps, .IDENTIFIER, "Expected 'as' after '#'");
@@ -795,8 +1009,9 @@ parse_hash_as_using_struct_field :: (ps: *Parse_State) -> *Node {
     name_token := expect(ps, .IDENTIFIER, "Expected using struct field name");
     expect(ps, .COLON, "Expected ':' after using struct field name");
 
-    field := new_node(.STRUCT_FIELD, hash.span);
+    field := new_node(.STRUCT_FIELD, name_token.span);
     field.name = name_token.text;
+    field.is_using = true;
     field.type_node = parse_type(ps);
     if match(ps, .EQUAL) field.rhs = parse_expression(ps);
     match(ps, .SEMICOLON);
@@ -816,8 +1031,9 @@ parse_using_struct_field :: (ps: *Parse_State, using_token: Token) -> *Node {
 
     name_token := expect(ps, .IDENTIFIER, "Expected using struct field name");
     if match(ps, .SEMICOLON) {
-        field := new_node(.STRUCT_FIELD, using_token.span);
+        field := new_node(.STRUCT_FIELD, name_token.span);
         field.name = name_token.text;
+        field.is_using = true;
         type_node := new_node(.TYPE_NAME, name_token.span);
         type_node.name = name_token.text;
         field.type_node = type_node;
@@ -826,8 +1042,9 @@ parse_using_struct_field :: (ps: *Parse_State, using_token: Token) -> *Node {
 
     expect(ps, .COLON, "Expected ':' after using struct field name");
 
-    field := new_node(.STRUCT_FIELD, using_token.span);
+    field := new_node(.STRUCT_FIELD, name_token.span);
     field.name = name_token.text;
+    field.is_using = true;
     field.type_node = parse_type(ps);
     if match(ps, .EQUAL) field.rhs = parse_expression(ps);
     match(ps, .SEMICOLON);
@@ -845,8 +1062,13 @@ parse_param :: (ps: *Parse_State) -> *Node {
         }
     }
 
-    match(ps, .USING);
-    skip_param_modifiers(ps);
+    is_using := match(ps, .USING);
+    using_exceptions: [..] string;
+    skip_param_modifiers(ps, *using_exceptions);
+    while match(ps, .HASH) {
+        expect(ps, .IDENTIFIER, "Expected parameter directive name after '#'");
+        if match(ps, .OPEN_PAREN) skip_balanced_tokens(ps, .OPEN_PAREN, .CLOSE_PAREN);
+    }
 
     dollar_count := 0;
     while match(ps, .DOLLAR) dollar_count += 1;
@@ -854,6 +1076,8 @@ parse_param :: (ps: *Parse_State) -> *Node {
 
     param := new_node(.PARAM, name_token.span);
     param.name = name_token.text;
+    param.is_using = is_using;
+    param.using_exceptions = using_exceptions;
     for 0..dollar_count-1 param.name = tprint("$%", param.name);
 
     if match(ps, .COLON_EQUAL) {
@@ -862,21 +1086,34 @@ parse_param :: (ps: *Parse_State) -> *Node {
     }
 
     expect(ps, .COLON, "Expected ':' or ':=' after parameter name");
-    param.type_node = parse_type(ps);
+    // A comma after a callback's return type belongs to this surrounding
+    // parameter list. Unparenthesized multi-return callback types are
+    // syntactically ambiguous here and must use a parenthesized return list.
+    param.type_node = parse_type(ps, allow_unparenthesized_function_return_list = false);
     if match(ps, .EQUAL) param.rhs = parse_expression(ps);
     return param;
 }
 
-skip_param_modifiers :: (ps: *Parse_State) {
+skip_param_modifiers :: (ps: *Parse_State, using_exceptions: *[..] string = null) {
     while match(ps, .COMMA) {
         modifier := expect(ps, .IDENTIFIER, "Expected parameter modifier name");
         if modifier.text == "except" && match(ps, .OPEN_PAREN) {
-            skip_balanced_tokens(ps, .OPEN_PAREN, .CLOSE_PAREN);
+            depth := 1;
+            while depth > 0 && !check(ps, .EOF) && !ps.has_error {
+                token := advance(ps);
+                if token.kind == .OPEN_PAREN {
+                    depth += 1;
+                } else if token.kind == .CLOSE_PAREN {
+                    depth -= 1;
+                } else if depth == 1 && token.kind == .IDENTIFIER && using_exceptions != null {
+                    array_add(using_exceptions, token.text);
+                }
+            }
         }
     }
 }
 
-parse_type :: (ps: *Parse_State) -> *Node {
+parse_type :: (ps: *Parse_State, allow_unparenthesized_function_return_list: bool = true) -> *Node {
     #if PARSER_PROFILE_ENABLED {
         profile_start_index := ps.index;
         profile_start := current_time_monotonic();
@@ -891,7 +1128,7 @@ parse_type :: (ps: *Parse_State) -> *Node {
         hash := previous(ps);
         name := expect(ps, .IDENTIFIER, "Expected type directive name after '#'");
         if name.text == "type" {
-            node := parse_type(ps);
+            node := parse_type(ps, allow_unparenthesized_function_return_list);
             skip_type_suffix_directives(ps);
             return node;
         }
@@ -902,7 +1139,7 @@ parse_type :: (ps: *Parse_State) -> *Node {
         return node;
     }
 
-    if check(ps, .OPEN_PAREN) return parse_function_type(ps);
+    if check(ps, .OPEN_PAREN) return parse_function_type(ps, allow_unparenthesized_function_return_list);
 
     if match(ps, .STRUCT) || match(ps, .UNION) return parse_struct_after_header(ps, previous(ps));
     if match(ps, .ENUM) || match(ps, .ENUM_FLAGS) return parse_anonymous_enum_type(ps, previous(ps));
@@ -910,7 +1147,7 @@ parse_type :: (ps: *Parse_State) -> *Node {
     if match(ps, .DOT_DOT) {
         dot_dot := previous(ps);
         node := new_node(.VARIADIC_TYPE, dot_dot.span);
-        node.type_node = parse_type(ps);
+        node.type_node = parse_type(ps, allow_unparenthesized_function_return_list);
         return node;
     }
 
@@ -924,22 +1161,21 @@ parse_type :: (ps: *Parse_State) -> *Node {
             node.rhs = parse_expression(ps);
         }
         expect(ps, .CLOSE_BRACKET, "Expected ']' after array count");
-        node.type_node = parse_type(ps);
+        node.type_node = parse_type(ps, allow_unparenthesized_function_return_list);
         return node;
     }
 
     if match(ps, .STAR) {
         star := previous(ps);
         node := new_node(.POINTER_TYPE, star.span);
-        node.type_node = parse_type(ps);
+        node.type_node = parse_type(ps, allow_unparenthesized_function_return_list);
         return node;
     }
 
     if match(ps, .DOLLAR) {
-        dollar := previous(ps);
         name_token := expect(ps, .IDENTIFIER, "Expected polymorphic type name after '$'");
-        node := new_node(.POLYMORPHIC_TYPE, dollar.span);
-        node.name = name_token.text;
+        node := new_node(.POLYMORPHIC_TYPE, name_token.span);
+        node.name = tprint("$%", name_token.text);
 
         if match(ps, .SLASH) {
             slash := previous(ps);
@@ -947,19 +1183,35 @@ parse_type :: (ps: *Parse_State) -> *Node {
 
             constraint := new_node(.INTERFACE_TYPE, slash.span);
             if check(ps, .DOT) || check(ps, .OPEN_BRACKET) constraint.type_node = parse_expression(ps);
-            else constraint.type_node = parse_type(ps);
+            else constraint.type_node = parse_type(ps, allow_unparenthesized_function_return_list);
             node.type_node = constraint;
         }
 
         return node;
     }
 
-    name_token := expect(ps, .IDENTIFIER, "Expected type name");
+    if !check(ps, .IDENTIFIER) && !check(ps, .INTERFACE) {
+        span := current(ps).span;
+        set_error(ps, "Expected type name", span);
+        return new_node(.ERROR, span);
+    }
+
+    name_token := expect_name_token(ps, "Expected type name");
     node := new_node(.TYPE_NAME, name_token.span);
     node.name = name_token.text;
 
+    qualified := false;
     while match(ps, .DOT) {
         field := expect(ps, .IDENTIFIER, "Expected type name after '.'");
+        if !qualified {
+            base_segment := new_node(.TYPE_NAME, name_token.span);
+            base_segment.name = name_token.text;
+            array_add(*node.args, base_segment);
+            qualified = true;
+        }
+        field_segment := new_node(.TYPE_NAME, field.span);
+        field_segment.name = field.text;
+        array_add(*node.args, field_segment);
         node.name = tprint("%.%", node.name, field.text);
     }
 
@@ -969,7 +1221,7 @@ parse_type :: (ps: *Parse_State) -> *Node {
 
         if !check(ps, .CLOSE_PAREN) {
             while !ps.has_error {
-                arg := parse_type_application_argument(ps);
+                arg := parse_type_application_argument(ps, allow_unparenthesized_function_return_list);
                 if arg array_add(*application.args, arg);
                 if !match(ps, .COMMA) break;
                 if check(ps, .CLOSE_PAREN) break;
@@ -989,12 +1241,12 @@ parse_type :: (ps: *Parse_State) -> *Node {
     return node;
 }
 
-parse_type_application_argument :: (ps: *Parse_State) -> *Node {
+parse_type_application_argument :: (ps: *Parse_State, allow_unparenthesized_function_return_list: bool = true) -> *Node {
     if check(ps, .INT_LITERAL) || check(ps, .FLOAT_LITERAL) || check(ps, .STRING_LITERAL) || check(ps, .DOT) || check(ps, .DOLLAR) {
         return parse_expression(ps);
     }
 
-    return parse_type(ps);
+    return parse_type(ps, allow_unparenthesized_function_return_list);
 }
 
 skip_type_suffix_directives :: (ps: *Parse_State) {
@@ -1024,7 +1276,12 @@ parse_anonymous_enum_type :: (ps: *Parse_State, enum_token: Token) -> *Node {
     open := expect(ps, .OPEN_BRACE, "Expected '{' before enum type body");
     node.body = new_node(.BLOCK, open.span);
 
-    while !check(ps, .CLOSE_BRACE) && !check(ps, .EOF) && !ps.has_error {
+    while !check(ps, .CLOSE_BRACE) && !check(ps, .EOF) {
+        if ps.has_error {
+            error_node := parser_recover_pending_error(ps, ps.index);
+            if error_node array_add(*node.declarations, error_node);
+            continue;
+        }
         if check(ps, .IDENTIFIER) {
             value := advance(ps);
             entry := new_node(.CONST_DECL, value.span);
@@ -1125,9 +1382,18 @@ parse_block_after_open :: (ps: *Parse_State, open: Token) -> *Node {
 
     block := new_node(.BLOCK, open.span);
 
-    while !check(ps, .CLOSE_BRACE) && !check(ps, .EOF) && !ps.has_error {
+    while !check(ps, .CLOSE_BRACE) && !check(ps, .EOF) {
+        statement_start := ps.index;
         stmt := parse_statement(ps);
         if stmt array_add(*block.statements, stmt);
+        if ps.has_error {
+            error_node := parser_recover_pending_error(ps, statement_start);
+            if error_node array_add(*block.statements, error_node);
+        } else if ps.index == statement_start {
+            set_error(ps, "Expected statement", current(ps).span);
+            error_node := parser_recover_pending_error(ps, statement_start);
+            if error_node array_add(*block.statements, error_node);
+        }
     }
 
     expect(ps, .CLOSE_BRACE, "Expected '}' after block");
@@ -1221,17 +1487,29 @@ parse_standalone_else_statement :: (ps: *Parse_State, else_token: Token) -> *Nod
 }
 
 parse_using_local_statement :: (ps: *Parse_State) -> *Node {
-    skip_param_modifiers(ps);
+    exceptions: [..] string;
+    skip_param_modifiers(ps, *exceptions);
 
     if check(ps, .IDENTIFIER) {
-        if check_at(ps, 1, .COLON_EQUAL) return parse_local_infer_decl(ps);
-        if check_at(ps, 1, .COLON) return parse_local_typed_decl(ps);
+        declaration: *Node;
+        if check_at(ps, 1, .COLON_EQUAL) declaration = parse_local_infer_decl(ps);
+        else if check_at(ps, 1, .COLON) declaration = parse_local_typed_decl(ps);
+        if declaration != null {
+            declaration.is_using = true;
+            declaration.using_exceptions = exceptions;
+            return declaration;
+        }
     }
 
     expr := parse_expression_list(ps);
-    if expr == null return null;
+    if expr == null {
+        array_free(exceptions);
+        return null;
+    }
 
     node := new_node(.EXPRESSION_STATEMENT, expr.span);
+    node.is_using = true;
+    node.using_exceptions = exceptions;
     node.rhs = expr;
     match(ps, .SEMICOLON);
     return node;
@@ -1282,6 +1560,7 @@ parse_local_group_constant_decl :: (ps: *Parse_State) -> *Node {
 
     expect(ps, .COLON_COLON, "Expected '::' after local constant names");
     value := parse_expression_list(ps);
+    node.rhs = value;
     match(ps, .SEMICOLON);
 
     for names {
@@ -1473,7 +1752,7 @@ parse_for_statement :: (ps: *Parse_State, for_token: Token) -> *Node {
     skip_for_modifiers(ps);
 
     if is_for_iterator_header_ahead(ps) {
-        node.name = parse_for_iterator_names(ps);
+        node.name = parse_for_iterator_names(ps, node);
         expect(ps, .COLON, "Expected ':' after for iterator name");
         node.lhs = parse_expression(ps);
     } else {
@@ -1550,13 +1829,17 @@ is_for_iterator_header_ahead :: (ps: *Parse_State) -> bool {
     return false;
 }
 
-parse_for_iterator_names :: (ps: *Parse_State) -> string {
+parse_for_iterator_names :: (ps: *Parse_State, for_node: *Node) -> string {
     result := "";
 
     while !ps.has_error {
         match(ps, .BACKTICK);
         is_pointer := match(ps, .STAR);
         name := expect(ps, .IDENTIFIER, "Expected for iterator name");
+
+        iterator := new_node(.LOCAL_INFER_DECL, name.span);
+        iterator.name = name.text;
+        array_add(*for_node.params, iterator);
 
         part := name.text;
         if is_pointer part = tprint("*%", part);
@@ -1635,6 +1918,74 @@ parse_compiler_directive_statement :: (ps: *Parse_State, hash_token: Token) -> *
         node.name = name.text;
     }
 
+    if node.name == "if" {
+        node.lhs = parse_expression(ps);
+        if match(ps, .THEN) {
+            stmt := parse_statement(ps);
+            if stmt {
+                block := new_node(.BLOCK, stmt.span);
+                array_add(*block.statements, stmt);
+                node.body = block;
+            }
+        } else if match(ps, .OPEN_BRACE) {
+            node.body = parse_block_after_open(ps, previous(ps));
+        } else {
+            match(ps, .SEMICOLON);
+            return node;
+        }
+
+        if match(ps, .ELSE) {
+            if match(ps, .OPEN_BRACE) {
+                node.rhs = parse_block_after_open(ps, previous(ps));
+            } else if match(ps, .HASH) {
+                node.rhs = parse_compiler_directive_statement(ps, previous(ps));
+            } else if match(ps, .IF) {
+                node.rhs = parse_if_statement(ps, previous(ps));
+            } else {
+                node.rhs = parse_statement(ps);
+            }
+        }
+        return node;
+    }
+
+    while check(ps, .COMMA) && check_at(ps, 1, .IDENTIFIER) {
+        advance(ps);
+        advance(ps);
+    }
+
+    // Assembly uses its own grammar inside the braces (register suffixes,
+    // mappings such as `name:`, and instruction operands). Keep the balanced
+    // body opaque to the Jai parser so an otherwise valid #asm block cannot
+    // make semantic analysis fail for the remainder of the source file.
+    if node.name == "asm" && match(ps, .OPEN_BRACE) {
+        skip_balanced_tokens(ps, .OPEN_BRACE, .CLOSE_BRACE);
+        match(ps, .SEMICOLON);
+        return node;
+    }
+
+    if match(ps, .ARROW) {
+        node.return_type = parse_return_type(ps);
+        if match(ps, .OPEN_BRACE) {
+            node.body = parse_block_after_open(ps, previous(ps));
+        } else if can_start_primary_expression(ps) {
+            node.rhs = parse_expression(ps);
+        }
+        match(ps, .SEMICOLON);
+        return node;
+    }
+
+    if match(ps, .OPEN_BRACE) {
+        node.body = parse_block_after_open(ps, previous(ps));
+        match(ps, .SEMICOLON);
+        return node;
+    }
+
+    if can_start_primary_expression(ps) {
+        node.lhs = parse_expression_list(ps);
+        match(ps, .SEMICOLON);
+        return node;
+    }
+
     while !check(ps, .SEMICOLON) && !check(ps, .CLOSE_BRACE) && !check(ps, .EOF) && !ps.has_error {
         if match(ps, .OPEN_BRACE) {
             skip_balanced_tokens(ps, .OPEN_BRACE, .CLOSE_BRACE);
@@ -1676,10 +2027,20 @@ parse_return_expression_list :: (ps: *Parse_State) -> *Node {
 
 parse_local_infer_decl :: (ps: *Parse_State) -> *Node {
     name_token := expect(ps, .IDENTIFIER, "Expected local name");
-    expect(ps, .COLON_EQUAL, "Expected ':=' after local name");
+    declaration_token := expect(ps, .COLON_EQUAL, "Expected ':=' after local name");
 
     node := new_node(.LOCAL_INFER_DECL, name_token.span);
     node.name = name_token.text;
+
+    // During an edit, `name :=` followed by a previously valid declaration on
+    // the next line has no initializer yet. Do not steal that declaration as
+    // the initializer merely because newlines are otherwise whitespace in Jai.
+    if current(ps).span.line > declaration_token.span.line && parser_token_starts_local_declaration(ps) {
+        set_error(ps, "Expected initializer after ':='", declaration_token.span);
+        node.rhs = new_node(.ERROR, declaration_token.span);
+        return node;
+    }
+
     node.rhs = parse_expression(ps);
     match(ps, .SEMICOLON);
     return node;
@@ -1687,10 +2048,20 @@ parse_local_infer_decl :: (ps: *Parse_State) -> *Node {
 
 parse_local_typed_decl :: (ps: *Parse_State) -> *Node {
     name_token := expect(ps, .IDENTIFIER, "Expected local name");
-    expect(ps, .COLON, "Expected ':' after local name");
+    declaration_token := expect(ps, .COLON, "Expected ':' after local name");
 
     node := new_node(.LOCAL_TYPED_DECL, name_token.span);
     node.name = name_token.text;
+
+    // Preserve a valid following statement while the user has only typed the
+    // declaration colon. A genuine multi-line type does not itself begin with
+    // another local declaration marker.
+    if current(ps).span.line > declaration_token.span.line && parser_token_starts_local_declaration(ps) {
+        set_error(ps, "Expected type after ':'", declaration_token.span);
+        node.type_node = new_node(.ERROR, declaration_token.span);
+        return node;
+    }
+
     node.type_node = parse_type(ps);
     if match(ps, .EQUAL) || match(ps, .COLON) node.rhs = parse_expression(ps);
     match(ps, .SEMICOLON);
@@ -1919,15 +2290,29 @@ parse_postfix_expression :: (ps: *Parse_State) -> *Node {
             node.callee = expr;
 
             if !check(ps, .CLOSE_PAREN) {
+                previous_was_comma := false;
                 while !ps.has_error {
+                    // An unfinished call immediately before a valid local
+                    // declaration is one of the most common transient editor
+                    // states. The declaration cannot be a call argument, so
+                    // leave it for the surrounding block's recovery point.
+                    if current(ps).span.line > open.span.line && parser_token_starts_local_declaration(ps) {
+                        set_error(ps, "Expected ')' after call arguments", open.span);
+                        break;
+                    }
+
                     if match(ps, .COMMA) {
+                        if previous_was_comma && node.implicit_arg_start < 0 node.implicit_arg_start = node.args.count;
+                        previous_was_comma = true;
                         if check(ps, .CLOSE_PAREN) break;
                         continue;
                     }
 
+                    previous_was_comma = false;
                     arg := parse_call_argument(ps);
                     if arg array_add(*node.args, arg);
                     if !match(ps, .COMMA) break;
+                    previous_was_comma = true;
                     if check(ps, .CLOSE_PAREN) break;
                 }
             }
@@ -2067,7 +2452,10 @@ parse_primary_expression :: (ps: *Parse_State) -> *Node {
         }
 
         if can_start_primary_expression(ps) {
-            node.rhs = parse_primary_expression(ps);
+            // Directives such as `#run procedure(argument)` apply to the
+            // complete following expression, including postfix calls and
+            // binary operators, rather than only its first identifier.
+            node.rhs = parse_expression(ps);
         }
 
         return node;
@@ -2108,9 +2496,8 @@ parse_primary_expression :: (ps: *Parse_State) -> *Node {
     }
 
     if match(ps, .DOLLAR) {
-        dollar := previous(ps);
         name := expect(ps, .IDENTIFIER, "Expected polymorphic expression name after '$'");
-        node := new_node(.IDENTIFIER_EXPR, dollar.span);
+        node := new_node(.IDENTIFIER_EXPR, name.span);
         node.name = tprint("$%", name.text);
         return node;
     }
@@ -2368,7 +2755,7 @@ is_struct_literal_designator_ahead :: (ps: *Parse_State) -> bool {
     return false;
 }
 
-parse_function_type :: (ps: *Parse_State) -> *Node {
+parse_function_type :: (ps: *Parse_State, allow_unparenthesized_return_list: bool = true) -> *Node {
     open := expect(ps, .OPEN_PAREN, "Expected '(' before function type parameters");
     node := new_node(.FUNCTION_TYPE, open.span);
 
@@ -2383,7 +2770,15 @@ parse_function_type :: (ps: *Parse_State) -> *Node {
     }
 
     expect(ps, .CLOSE_PAREN, "Expected ')' after function type parameters");
-    if match(ps, .ARROW) node.return_type = parse_return_type(ps);
+    if match(ps, .ARROW) {
+        if allow_unparenthesized_return_list {
+            node.return_type = parse_return_type(ps);
+        } else if check(ps, .OPEN_PAREN) && is_parenthesized_return_type_list_ahead(ps) {
+            node.return_type = parse_parenthesized_return_type_list(ps);
+        } else {
+            node.return_type = parse_return_type_item(ps);
+        }
+    }
     skip_type_suffix_directives(ps);
     return node;
 }
@@ -2426,6 +2821,7 @@ new_node :: (kind: Node_Kind, span: Source_Span) -> *Node {
     node := New(Node);
     node.kind = kind;
     node.span = span;
+    node.implicit_arg_start = -1;
     return node;
 }
 
@@ -2476,9 +2872,103 @@ expect_name_token :: (ps: *Parse_State, message: string) -> Token {
     return token;
 }
 
+parser_token_can_start_statement :: (kind: Token_Kind) -> bool {
+    return kind == .IDENTIFIER || kind == .RETURN || kind == .IF || kind == .FOR ||
+           kind == .WHILE || kind == .DEFER || kind == .USING || kind == .STRUCT ||
+           kind == .UNION || kind == .HASH || kind == .AT || kind == .BACKTICK ||
+           kind == .OPEN_BRACE || kind == .CAST || kind == .IFX;
+}
+
+parser_token_starts_local_declaration :: (ps: *Parse_State) -> bool {
+    if !check(ps, .IDENTIFIER) return false;
+    return check_at(ps, 1, .COLON) || check_at(ps, 1, .COLON_EQUAL) ||
+           check_at(ps, 1, .COLON_COLON);
+}
+
+parser_token_can_start_top_level_item :: (ps: *Parse_State) -> bool {
+    kind := current(ps).kind;
+    if kind == .HASH || kind == .AT || kind == .USING || kind == .ELSE return true;
+    if kind != .IDENTIFIER && kind != .INTERFACE return false;
+
+    // A declaration separator on the same source line is a strong recovery
+    // anchor.  This avoids treating an identifier in a broken expression as a
+    // new file item merely because it starts a new visual line.
+    scan := ps.index + 1;
+    line := current(ps).span.line;
+    while scan < ps.tokens.count && ps.tokens[scan].span.line == line {
+        kind = ps.tokens[scan].kind;
+        if kind == .COLON || kind == .COLON_COLON return true;
+        if kind == .SEMICOLON || kind == .OPEN_BRACE || kind == .CLOSE_BRACE return false;
+        scan += 1;
+    }
+    return false;
+}
+
+parser_recover_pending_error :: (ps: *Parse_State, start_index: int, top_level := false) -> *Node {
+    if !ps.has_error return null;
+
+    error_line := ps.error_span.line;
+    paren_depth := 0;
+    bracket_depth := 0;
+    brace_depth := 0;
+
+    while !check(ps, .EOF) {
+        kind := current(ps).kind;
+        at_boundary_depth := paren_depth == 0 && bracket_depth == 0 && brace_depth == 0;
+
+        if at_boundary_depth {
+            if kind == .CLOSE_BRACE break;
+            if kind == .SEMICOLON {
+                advance(ps);
+                break;
+            }
+
+            later_line := current(ps).span.line > error_line;
+            if later_line {
+                if top_level && parser_token_can_start_top_level_item(ps) break;
+                if !top_level && parser_token_can_start_statement(kind) break;
+            }
+        }
+
+        if kind == .OPEN_PAREN {
+            paren_depth += 1;
+        } else if kind == .CLOSE_PAREN {
+            if paren_depth > 0 paren_depth -= 1;
+        } else if kind == .OPEN_BRACKET {
+            bracket_depth += 1;
+        } else if kind == .CLOSE_BRACKET {
+            if bracket_depth > 0 bracket_depth -= 1;
+        } else if kind == .OPEN_BRACE {
+            brace_depth += 1;
+        } else if kind == .CLOSE_BRACE {
+            if brace_depth > 0 brace_depth -= 1;
+        }
+        advance(ps);
+    }
+
+    start_token := ifx start_index >= 0 && start_index < ps.tokens.count then ps.tokens[start_index] else current(ps);
+    end_position := start_token.span.start_position_in_input + max(start_token.span.count, 1);
+    if ps.index > start_index && ps.index > 0 {
+        end_token := previous(ps);
+        end_position = max(end_position, end_token.span.start_position_in_input + end_token.span.count);
+    }
+
+    error_node := new_node(.ERROR, start_token.span);
+    error_node.span.count = max(end_position - error_node.span.start_position_in_input, 1);
+
+    ps.has_error = false;
+    ps.error_message = "";
+    ps.error_span = .{};
+    return error_node;
+}
+
 set_error :: (ps: *Parse_State, message: string, span: Source_Span) {
     if ps.has_error return;
     ps.has_error = true;
     ps.error_message = message;
     ps.error_span = span;
+
+    error := Error.{ message = message, span = span };
+    if ps.error_count < ps.errors.count ps.errors[ps.error_count] = error;
+    ps.error_count += 1;
 }

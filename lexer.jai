@@ -7,9 +7,9 @@ tokens, or two-character operator tokens.
 
 Each token stores its kind, the original source slice, and the source span where
 it began. The lexer does not allocate copied token text; token strings point
-back into the input string. When it finds an unexpected character or unterminated
-string, it records the first error and lex stops after returning the failed
-result.
+back into the input string. Lexical errors are recorded separately from the
+token stream, which still continues through EOF so an editor can parse an
+incomplete revision into a partial tree.
 */
 
 Lexer :: struct {
@@ -28,19 +28,27 @@ lex :: (input: string) -> Lexer_Result {
     result: Lexer_Result;
     array_reserve(*result.tokens, input.count / 4);
 
-    while !lexer.has_error {
+    while true {
         token := next_token(*lexer);
         array_add(*result.tokens, token);
+
+        if lexer.has_error {
+            error := Error.{ message = lexer.error_message, span = lexer.error_span };
+            if result.error_count == 0 result.error = error;
+            if result.error_count < result.errors.count result.errors[result.error_count] = error;
+            result.error_count += 1;
+
+            // Token consumers advance past invalid input (or to EOF for an
+            // unterminated literal), so subsequent tokens remain available.
+            lexer.has_error = false;
+            lexer.error_message = "";
+            lexer.error_span = .{};
+        }
+
         if token.kind == .EOF break;
     }
 
-    if lexer.has_error {
-        result.success = false;
-        result.error = .{ message = lexer.error_message, span = lexer.error_span };
-        return result;
-    }
-
-    result.success = true;
+    result.success = result.error_count == 0;
     return result;
 }
 
@@ -361,9 +369,13 @@ keyword_kind :: inline (text: string) -> Token_Kind {
         return .IDENTIFIER;
     }
 
+    if text.count == 9 {
+        if text[0] == #char "i" && text == "interface" return .INTERFACE;
+        return .IDENTIFIER;
+    }
+
     if text.count == 10 {
         if text[0] == #char "e" && text == "enum_flags" return .ENUM_FLAGS;
-        if text[0] == #char "i" && text == "interface" return .INTERFACE;
         return .IDENTIFIER;
     }
 
@@ -452,7 +464,7 @@ consume_string_token :: (lexer: *Lexer) -> Token {
 
     span := make_span(start_position_in_input, lexer.position, start_line, start_column);
     set_error(lexer, "Unterminated string literal", span);
-    return .{ kind = .INVALID, text = span_text(lexer.source_code, span), span = span };
+    return .{ kind = .STRING_LITERAL, text = span_text(lexer.source_code, span), span = span };
 }
 
 consume_raw_string_token :: (lexer: *Lexer) -> Token {
@@ -493,7 +505,7 @@ consume_raw_string_token :: (lexer: *Lexer) -> Token {
 
     span := make_span(start_position_in_input, lexer.position, start_line, start_column);
     set_error(lexer, "Unterminated #string literal", span);
-    return .{ kind = .INVALID, text = span_text(lexer.source_code, span), span = span };
+    return .{ kind = .STRING_LITERAL, text = span_text(lexer.source_code, span), span = span };
 }
 
 starts_with_at_current_position :: (lexer: *Lexer, text: string) -> bool {

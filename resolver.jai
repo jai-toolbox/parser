@@ -13,6 +13,7 @@ Resolver_Symbol_Kind :: enum {
     FUNCTION;
     STRUCT;
     ENUM;
+    TYPE_PARAM;
     PARAM;
     LOCAL;
     FIELD;
@@ -24,12 +25,26 @@ Resolver_Symbol :: struct {
     declaration_node: *Node;
     file_path: string;
     scope: *Resolver_Scope;
+    id: Resolver_Symbol_Id;
+    scope_rank: int;
+}
+
+Resolver_Symbol_Id :: struct {
+    file_path: string;
+    start: int;
+    count: int;
+}
+
+Resolver_Symbol_Bucket :: struct {
+    name: string;
+    symbols: [..] *Resolver_Symbol;
 }
 
 Resolver_Reference :: struct {
     name: string;
     node: *Node;
     symbol: *Resolver_Symbol;
+    symbol_bucket: *Resolver_Symbol_Bucket;
     file_path: string;
     scope: *Resolver_Scope;
 }
@@ -38,6 +53,8 @@ Resolver_Scope :: struct {
     parent: *Resolver_Scope;
     symbols: [..] *Resolver_Symbol;
     symbols_by_name: Table(string, *Resolver_Symbol);
+    symbol_buckets: [..] *Resolver_Symbol_Bucket;
+    symbol_bucket_by_name: Table(string, *Resolver_Symbol_Bucket);
 }
 
 Resolver_File_Scope :: struct {
@@ -52,6 +69,7 @@ Resolver_Directory_Scope :: struct {
 
 Resolver_Result :: struct {
     root_scope: *Resolver_Scope;
+    scopes: [..] *Resolver_Scope;
     directory_scopes: [..] Resolver_Directory_Scope;
     file_scopes: [..] Resolver_File_Scope;
     symbols: [..] *Resolver_Symbol;
@@ -61,17 +79,19 @@ Resolver_Result :: struct {
 Resolver_Input_File :: struct {
     path: string;
     root: *Node;
+    scope_rank: int;
 }
 
 Resolver_State :: struct {
     result: Resolver_Result;
     current_scope: *Resolver_Scope;
     file_path: string;
+    file_scope_rank: int;
 }
 
 resolve_symbols :: (root: *Node) -> Resolver_Result {
     state: Resolver_State;
-    state.result.root_scope = new_resolver_scope(null);
+    state.result.root_scope = new_resolver_scope(*state, null);
     state.current_scope = state.result.root_scope;
 
     if root == null || root.kind != .FILE return state.result;
@@ -84,12 +104,16 @@ resolve_symbols :: (root: *Node) -> Resolver_Result {
         resolve_top_level_declaration(*state, declaration);
     }
 
+    for statement: root.statements {
+        resolve_statement(*state, statement);
+    }
+
     return state.result;
 }
 
 resolve_project_symbols :: (files: [] Resolver_Input_File) -> Resolver_Result {
     state: Resolver_State;
-    state.result.root_scope = new_resolver_scope(null);
+    state.result.root_scope = new_resolver_scope(*state, null);
     state.current_scope = state.result.root_scope;
 
     for file: files {
@@ -102,6 +126,7 @@ resolve_project_symbols :: (files: [] Resolver_Input_File) -> Resolver_Result {
         array_add(*state.result.file_scopes, file_scope);
 
         state.file_path = file.path;
+        state.file_scope_rank = file.scope_rank;
         state.current_scope = file_scope.scope;
         for declaration: file.root.declarations {
             add_declaration_symbol(*state, declaration, true);
@@ -116,6 +141,7 @@ resolve_project_symbols :: (files: [] Resolver_Input_File) -> Resolver_Result {
         if file_scope == null continue;
 
         state.file_path = file.path;
+        state.file_scope_rank = file.scope_rank;
         state.current_scope = file_scope;
         for declaration: file.root.declarations {
             resolve_top_level_declaration(*state, declaration);
@@ -133,10 +159,14 @@ resolve_project_symbols_for_file :: (files: [] Resolver_Input_File, target_path:
 
 resolve_project_symbols_for_files :: (files: [] Resolver_Input_File, target_paths: [] string) -> Resolver_Result {
     state: Resolver_State;
-    state.result.root_scope = new_resolver_scope(null);
+    state.result.root_scope = new_resolver_scope(*state, null);
     state.current_scope = state.result.root_scope;
 
+    // The caller's DefMap owns dependency declarations. This query builds the
+    // lexical/body resolver only for requested files, matching rust-analyzer's
+    // split between module name resolution and per-body SourceAnalyzer state.
     for file: files {
+        if !path_is_in_resolver_list(file.path, target_paths) continue;
         if file.root == null || file.root.kind != .FILE continue;
         directory_scope := get_or_create_directory_scope(*state, resolver_directory_for_path(file.path));
 
@@ -146,6 +176,7 @@ resolve_project_symbols_for_files :: (files: [] Resolver_Input_File, target_path
         array_add(*state.result.file_scopes, file_scope);
 
         state.file_path = file.path;
+        state.file_scope_rank = file.scope_rank;
         state.current_scope = file_scope.scope;
         for declaration: file.root.declarations {
             add_declaration_symbol(*state, declaration, true);
@@ -161,6 +192,7 @@ resolve_project_symbols_for_files :: (files: [] Resolver_Input_File, target_path
         if file_scope == null continue;
 
         state.file_path = file.path;
+        state.file_scope_rank = file.scope_rank;
         state.current_scope = file_scope;
         for declaration: file.root.declarations {
             resolve_top_level_declaration(*state, declaration);
@@ -197,16 +229,15 @@ export_declaration_symbol_to_project :: (state: *Resolver_State, declaration: *N
 
     if !is_declaration_symbol_kind(declaration.kind) return;
 
-    symbol := find_symbol_in_scope(file_scope, declaration.name);
+    symbol := find_symbol_for_declaration_in_scope(file_scope, declaration.name, declaration);
     if symbol == null return;
-    if find_symbol_in_scope(state.result.root_scope, declaration.name) != null return;
-    array_add(*state.result.root_scope.symbols, symbol);
-    table_add(*state.result.root_scope.symbols_by_name, symbol.name, symbol);
+    resolver_scope_add_existing_symbol(state.result.root_scope, symbol);
 }
 
-new_resolver_scope :: (parent: *Resolver_Scope) -> *Resolver_Scope {
+new_resolver_scope :: (state: *Resolver_State, parent: *Resolver_Scope) -> *Resolver_Scope {
     scope := New(Resolver_Scope);
     scope.parent = parent;
+    array_add(*state.result.scopes, scope);
     return scope;
 }
 
@@ -241,13 +272,13 @@ get_or_create_directory_scope :: (state: *Resolver_State, directory_path: string
 
     directory_scope: Resolver_Directory_Scope;
     directory_scope.path = directory_path;
-    directory_scope.scope = new_resolver_scope(state.result.root_scope);
+    directory_scope.scope = new_resolver_scope(state, state.result.root_scope);
     array_add(*state.result.directory_scopes, directory_scope);
     return directory_scope.scope;
 }
 
 push_scope :: (state: *Resolver_State) {
-    state.current_scope = new_resolver_scope(state.current_scope);
+    state.current_scope = new_resolver_scope(state, state.current_scope);
 }
 
 pop_scope :: (state: *Resolver_State) {
@@ -259,8 +290,19 @@ pop_scope :: (state: *Resolver_State) {
 add_symbol :: (state: *Resolver_State, scope: *Resolver_Scope, name: string, kind: Resolver_Symbol_Kind, declaration_node: *Node) -> *Resolver_Symbol {
     if scope == null || name.count == 0 return null;
 
-    existing := find_symbol_in_scope(scope, name);
-    if existing != null return existing;
+    bucket := find_symbol_bucket_in_scope(scope, name);
+    if bucket != null {
+        for existing: bucket.symbols {
+            if existing.declaration_node == declaration_node return existing;
+        }
+
+        // Only procedures form overload sets. All other repeated spellings in
+        // one lexical scope keep the first declaration, matching ordinary
+        // shadowing and duplicate-declaration recovery.
+        if kind != .FUNCTION || bucket.symbols.count == 0 || bucket.symbols[0].kind != .FUNCTION {
+            return ifx bucket.symbols.count > 0 then bucket.symbols[0] else null;
+        }
+    }
 
     symbol := New(Resolver_Symbol);
     symbol.name = name;
@@ -268,10 +310,97 @@ add_symbol :: (state: *Resolver_State, scope: *Resolver_Scope, name: string, kin
     symbol.declaration_node = declaration_node;
     symbol.file_path = state.file_path;
     symbol.scope = scope;
+    symbol.scope_rank = state.file_scope_rank;
+    symbol.id.file_path = state.file_path;
+    if declaration_node != null {
+        symbol.id.start = declaration_node.span.start_position_in_input;
+        symbol.id.count = declaration_node.span.count;
+    }
     array_add(*scope.symbols, symbol);
-    table_add(*scope.symbols_by_name, symbol.name, symbol);
+    if bucket == null {
+        bucket = New(Resolver_Symbol_Bucket);
+        bucket.name = symbol.name;
+        array_add(*scope.symbol_buckets, bucket);
+        table_add(*scope.symbol_bucket_by_name, bucket.name, bucket);
+        table_add(*scope.symbols_by_name, symbol.name, symbol);
+    }
+    array_add(*bucket.symbols, symbol);
     array_add(*state.result.symbols, symbol);
     return symbol;
+}
+
+resolver_scope_add_existing_symbol :: (scope: *Resolver_Scope, symbol: *Resolver_Symbol) {
+    if scope == null || symbol == null || symbol.name.count == 0 return;
+
+    bucket := find_symbol_bucket_in_scope(scope, symbol.name);
+    if bucket != null {
+        for existing: bucket.symbols if existing == symbol return;
+        if bucket.symbols.count > 0 {
+            if symbol.scope_rank > bucket.symbols[0].scope_rank return;
+            if symbol.scope_rank < bucket.symbols[0].scope_rank {
+                array_reset(*bucket.symbols);
+                array_add(*bucket.symbols, symbol);
+                table_set(*scope.symbols_by_name, symbol.name, symbol);
+                array_add(*scope.symbols, symbol);
+                return;
+            }
+        }
+        if symbol.kind != .FUNCTION || bucket.symbols.count == 0 || bucket.symbols[0].kind != .FUNCTION return;
+        array_add(*bucket.symbols, symbol);
+        return;
+    }
+
+    bucket = New(Resolver_Symbol_Bucket);
+    bucket.name = symbol.name;
+    array_add(*bucket.symbols, symbol);
+    array_add(*scope.symbol_buckets, bucket);
+    table_add(*scope.symbol_bucket_by_name, bucket.name, bucket);
+    array_add(*scope.symbols, symbol);
+    table_add(*scope.symbols_by_name, symbol.name, symbol);
+}
+
+resolver_scope_add_symbol_alias :: (scope: *Resolver_Scope, alias: string, symbol: *Resolver_Symbol) {
+    if scope == null || symbol == null || alias.count == 0 return;
+    if find_symbol_bucket_in_scope(scope, alias) != null return;
+
+    bucket := New(Resolver_Symbol_Bucket);
+    bucket.name = alias;
+    array_add(*bucket.symbols, symbol);
+    array_add(*scope.symbol_buckets, bucket);
+    table_add(*scope.symbol_bucket_by_name, alias, bucket);
+    table_add(*scope.symbols_by_name, alias, symbol);
+}
+
+resolver_polymorphic_type_name :: (name: string) -> string {
+    result := name;
+    while result.count > 0 && result[0] == #char "$" {
+        result.data += 1;
+        result.count -= 1;
+    }
+    return result;
+}
+
+collect_polymorphic_type_declarations :: (state: *Resolver_State, node: *Node) {
+    if node == null return;
+
+    if node.kind == .POLYMORPHIC_TYPE && node.name.count > 0 {
+        name := resolver_polymorphic_type_name(node.name);
+        if name.count > 0 && find_symbol_in_scope(state.current_scope, name) == null {
+            symbol := add_symbol(state, state.current_scope, name, .TYPE_PARAM, node);
+            if node.name != name resolver_scope_add_symbol_alias(state.current_scope, node.name, symbol);
+        }
+    }
+
+    collect_polymorphic_type_declarations(state, node.type_node);
+    collect_polymorphic_type_declarations(state, node.return_type);
+    for param: node.params {
+        if param != null && param.kind == .PARAM {
+            collect_polymorphic_type_declarations(state, param.type_node);
+        } else {
+            collect_polymorphic_type_declarations(state, param);
+        }
+    }
+    for arg: node.args collect_polymorphic_type_declarations(state, arg);
 }
 
 add_declaration_symbol :: (state: *Resolver_State, declaration: *Node, top_level: bool) {
@@ -282,6 +411,11 @@ add_declaration_symbol :: (state: *Resolver_State, declaration: *Node, top_level
         return;
     }
 
+    original_name := declaration.name;
+    symbol_name := original_name;
+    polymorphic_parameter := declaration.kind == .PARAM && original_name.count > 0 && original_name[0] == #char "$";
+    if polymorphic_parameter symbol_name = resolver_polymorphic_type_name(original_name);
+
     kind := Resolver_Symbol_Kind.LOCAL;
     if top_level {
         if declaration.kind == .FUNCTION kind = .FUNCTION;
@@ -289,13 +423,17 @@ add_declaration_symbol :: (state: *Resolver_State, declaration: *Node, top_level
         else if declaration.kind == .ENUM_DECL kind = .ENUM;
         else kind = .GLOBAL;
     } else {
-        if declaration.kind == .PARAM kind = .PARAM;
+        if declaration.kind == .FUNCTION kind = .FUNCTION;
+        else if declaration.kind == .STRUCT_DECL kind = .STRUCT;
+        else if declaration.kind == .ENUM_DECL kind = .ENUM;
+        else if declaration.kind == .PARAM kind = .PARAM;
         else if declaration.kind == .STRUCT_FIELD kind = .FIELD;
         else kind = .LOCAL;
     }
 
     if is_declaration_symbol_kind(declaration.kind) {
-        add_symbol(state, state.current_scope, declaration.name, kind, declaration);
+        symbol := add_symbol(state, state.current_scope, symbol_name, kind, declaration);
+        if original_name != symbol_name resolver_scope_add_symbol_alias(state.current_scope, original_name, symbol);
     }
 }
 
@@ -346,6 +484,9 @@ resolve_function_declaration :: (state: *Resolver_State, fn: *Node) {
     push_scope(state);
     defer pop_scope(state);
 
+    for param: fn.params collect_polymorphic_type_declarations(state, param.type_node);
+    collect_polymorphic_type_declarations(state, fn.return_type);
+
     for param: fn.params {
         add_declaration_symbol(state, param, false);
         resolve_type_reference(state, param.type_node);
@@ -353,6 +494,7 @@ resolve_function_declaration :: (state: *Resolver_State, fn: *Node) {
     }
 
     resolve_type_reference(state, fn.return_type);
+    for directive: fn.statements resolve_statement(state, directive);
     resolve_block_contents(state, fn.body, create_scope = true);
 }
 
@@ -360,11 +502,20 @@ resolve_struct_declaration :: (state: *Resolver_State, node: *Node) {
     push_scope(state);
     defer pop_scope(state);
 
+    for param: node.params {
+        add_declaration_symbol(state, param, false);
+        resolve_type_reference(state, param.type_node);
+        resolve_expression(state, param.rhs);
+    }
+
     for field: node.declarations {
         if field.kind == .STRUCT_FIELD {
             add_declaration_symbol(state, field, false);
             resolve_type_reference(state, field.type_node);
+            resolve_expression(state, field.lhs);
             resolve_expression(state, field.rhs);
+        } else if field.kind == .COMPILER_DIRECTIVE_STATEMENT {
+            resolve_statement(state, field);
         } else {
             add_declaration_symbol(state, field, true);
             resolve_top_level_declaration(state, field);
@@ -447,7 +598,10 @@ resolve_statement :: (state: *Resolver_State, statement: *Node) {
 
         case .FOR_STATEMENT;
             resolve_expression(state, statement.lhs);
-            resolve_statement_body(state, statement.body, create_scope = true);
+            push_scope(state);
+            for iterator: statement.params add_declaration_symbol(state, iterator, false);
+            resolve_statement_body(state, statement.body, create_scope = false);
+            pop_scope(state);
 
         case .WHILE_STATEMENT;
             resolve_expression(state, statement.lhs);
@@ -457,7 +611,13 @@ resolve_statement :: (state: *Resolver_State, statement: *Node) {
             resolve_statement_body(state, statement.body, create_scope = true);
 
         case .COMPILER_DIRECTIVE_STATEMENT;
+            resolve_type_reference(state, statement.return_type);
+            resolve_expression(state, statement.lhs);
             resolve_statement_body(state, statement.body, create_scope = true);
+            if statement.rhs != null {
+                if statement.rhs.kind == .BLOCK resolve_block_contents(state, statement.rhs, create_scope = true);
+                else resolve_statement(state, statement.rhs);
+            }
 
         case;
             resolve_expression(state, statement);
@@ -526,6 +686,8 @@ resolve_expression :: (state: *Resolver_State, expression: *Node) {
 
         case .LAMBDA_EXPR;
             push_scope(state);
+            for param: expression.params collect_polymorphic_type_declarations(state, param.type_node);
+            collect_polymorphic_type_declarations(state, expression.return_type);
             for param: expression.params {
                 add_declaration_symbol(state, param, false);
                 resolve_type_reference(state, param.type_node);
@@ -551,7 +713,14 @@ resolve_expression :: (state: *Resolver_State, expression: *Node) {
             for param: expression.params resolve_type_reference(state, param);
 
         case .FUNCTION_TYPE;
-            for param: expression.params resolve_type_reference(state, param);
+            for param: expression.params {
+                if param != null && param.kind == .PARAM {
+                    resolve_type_reference(state, param.type_node);
+                    resolve_expression(state, param.rhs);
+                } else {
+                    resolve_type_reference(state, param);
+                }
+            }
             resolve_type_reference(state, expression.return_type);
 
         case .VARIADIC_TYPE;
@@ -565,6 +734,10 @@ resolve_expression :: (state: *Resolver_State, expression: *Node) {
             resolve_type_reference(state, expression.type_node);
 
         case .POLYMORPHIC_TYPE;
+            if expression.name.count > 0 {
+                symbol := find_symbol(state.current_scope, expression.name);
+                if symbol == null || symbol.declaration_node != expression add_reference(state, expression, expression.name);
+            }
             resolve_type_reference(state, expression.type_node);
 
         case .INTERFACE_TYPE;
@@ -599,6 +772,13 @@ is_builtin_type_name :: (name: string) -> bool {
 resolve_type_reference :: (state: *Resolver_State, type_node: *Node) {
     if type_node == null return;
     if type_node.kind == .TYPE_NAME && is_builtin_type_name(type_node.name) return;
+    if type_node.kind == .TYPE_NAME && type_node.args.count > 0 {
+        // Qualified types retain one NameRef-like node per path segment. The
+        // combined TYPE_NAME remains available to type inference, while each
+        // segment can independently inherit its declaration's semantic role.
+        for segment: type_node.args resolve_expression(state, segment);
+        return;
+    }
     resolve_expression(state, type_node);
 }
 
@@ -606,28 +786,51 @@ add_reference :: (state: *Resolver_State, node: *Node, name: string) {
     reference: Resolver_Reference;
     reference.name = name;
     reference.node = node;
-    reference.symbol = find_symbol(state.current_scope, name);
+    reference.symbol_bucket = find_symbol_bucket(state.current_scope, name);
+    if reference.symbol_bucket != null && reference.symbol_bucket.symbols.count > 0 {
+        reference.symbol = reference.symbol_bucket.symbols[0];
+    }
     reference.file_path = state.file_path;
     reference.scope = state.current_scope;
     array_add(*state.result.references, reference);
 }
 
 find_symbol :: (scope: *Resolver_Scope, name: string) -> *Resolver_Symbol {
+    bucket := find_symbol_bucket(scope, name);
+    if bucket == null || bucket.symbols.count == 0 return null;
+    return bucket.symbols[0];
+}
+
+find_symbol_bucket :: (scope: *Resolver_Scope, name: string) -> *Resolver_Symbol_Bucket {
     current := scope;
     while current != null {
-        symbol := find_symbol_in_scope(current, name);
-        if symbol != null return symbol;
+        bucket := find_symbol_bucket_in_scope(current, name);
+        if bucket != null return bucket;
         current = current.parent;
     }
     return null;
 }
 
-find_symbol_in_scope :: (scope: *Resolver_Scope, name: string) -> *Resolver_Symbol {
+find_symbol_bucket_in_scope :: (scope: *Resolver_Scope, name: string) -> *Resolver_Symbol_Bucket {
     if scope == null return null;
-
-    found, symbol := table_find(*scope.symbols_by_name, name);
+    found, bucket := table_find(*scope.symbol_bucket_by_name, name);
     if !found return null;
-    return symbol;
+    return bucket;
+}
+
+find_symbol_in_scope :: (scope: *Resolver_Scope, name: string) -> *Resolver_Symbol {
+    bucket := find_symbol_bucket_in_scope(scope, name);
+    if bucket == null || bucket.symbols.count == 0 return null;
+    return bucket.symbols[0];
+}
+
+find_symbol_for_declaration_in_scope :: (scope: *Resolver_Scope, name: string, declaration_node: *Node) -> *Resolver_Symbol {
+    bucket := find_symbol_bucket_in_scope(scope, name);
+    if bucket == null return null;
+    for symbol: bucket.symbols {
+        if symbol != null && symbol.declaration_node == declaration_node return symbol;
+    }
+    return null;
 }
 
 find_file_scope :: (result: Resolver_Result, file_path: string) -> *Resolver_Scope {
@@ -685,4 +888,32 @@ reference_count_for_symbol :: (result: Resolver_Result, symbol: *Resolver_Symbol
         if reference.symbol == symbol count += 1;
     }
     return count;
+}
+
+resolver_result_deinit :: (result: *Resolver_Result) {
+    if result == null return;
+
+    for symbol: result.symbols {
+        if symbol != null free(symbol);
+    }
+    for scope: result.scopes {
+        if scope == null continue;
+        for bucket: scope.symbol_buckets {
+            if bucket == null continue;
+            array_free(bucket.symbols);
+            free(bucket);
+        }
+        array_free(scope.symbols);
+        deinit(*scope.symbols_by_name);
+        array_free(scope.symbol_buckets);
+        deinit(*scope.symbol_bucket_by_name);
+        free(scope);
+    }
+
+    array_free(result.directory_scopes);
+    array_free(result.file_scopes);
+    array_free(result.symbols);
+    array_free(result.references);
+    array_free(result.scopes);
+    result.* = .{};
 }
