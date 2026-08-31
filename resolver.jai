@@ -559,7 +559,10 @@ resolve_statement :: (state: *Resolver_State, statement: *Node) {
 
         case .LOCAL_GROUP_DECL;
             resolve_expression(state, statement.rhs);
-            for child: statement.declarations add_declaration_symbol(state, child, false);
+            for child: statement.declarations {
+                resolve_type_reference(state, child.type_node);
+                add_declaration_symbol(state, child, false);
+            }
 
         case .LOCAL_INFER_DECL;
             resolve_expression(state, statement.rhs);

@@ -666,6 +666,7 @@ parse_global_group_typed_declaration_after_name :: (ps: *Parse_State, first_name
 
     if match(ps, .COLON_EQUAL) {
         value := parse_expression_list(ps);
+        node.rhs = value;
         match(ps, .SEMICOLON);
 
         for names {
@@ -746,6 +747,18 @@ parse_function_body_directives :: (ps: *Parse_State, fn: *Node) -> bool {
         if check(ps, .IDENTIFIER) {
             directive_name = current(ps).text;
             advance(ps);
+        }
+
+        if directive_name == "foreign" {
+            directive := new_node(.COMPILER_DIRECTIVE_STATEMENT, hash_token.span);
+            directive.name = directive_name;
+            if current(ps).span.line == start_line && can_start_primary_expression(ps) {
+                directive.lhs = parse_expression(ps);
+            }
+            array_add(*fn.statements, directive);
+            while !check(ps, .SEMICOLON) && !check(ps, .EOF) && !ps.has_error && current(ps).span.line == start_line advance(ps);
+            if match(ps, .SEMICOLON) return false;
+            continue;
         }
 
         while !check(ps, .OPEN_BRACE) && !check(ps, .EOF) && !ps.has_error {
@@ -2082,6 +2095,7 @@ parse_local_group_decl :: (ps: *Parse_State) -> *Node {
 
     if match(ps, .COLON_EQUAL) {
         value := parse_expression_list(ps);
+        node.rhs = value;
         match(ps, .SEMICOLON);
 
         for names {
@@ -2098,6 +2112,7 @@ parse_local_group_decl :: (ps: *Parse_State) -> *Node {
 
         default_value: *Node = null;
         if match(ps, .EQUAL) default_value = parse_expression(ps);
+        node.rhs = default_value;
         match(ps, .SEMICOLON);
 
         for names {
