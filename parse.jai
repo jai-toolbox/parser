@@ -191,8 +191,18 @@ parse_file :: (ps: *Parse_State) -> *Node {
 parse_top_level_items :: (ps: *Parse_State, root: *Node, stop_at_close_brace := false) {
     while !check(ps, .EOF) {
         if ps.has_error {
+            recovery_start := ps.index;
             error_node := parser_recover_pending_error(ps, ps.index, top_level = true);
             if error_node array_add(*root.statements, error_node);
+            // An unexpected top-level `}` is a valid stop token only for a
+            // nested item list. At the file root it used to make recovery
+            // return without consuming anything, after which the same token
+            // raised the same error and allocated another ERROR node forever.
+            if ps.index == recovery_start &&
+               !(stop_at_close_brace && check(ps, .CLOSE_BRACE)) &&
+               !check(ps, .EOF) {
+                advance(ps);
+            }
             continue;
         }
         if stop_at_close_brace && check(ps, .CLOSE_BRACE) return;
@@ -205,6 +215,15 @@ parse_top_level_items :: (ps: *Parse_State, root: *Node, stop_at_close_brace := 
             }
             if !check(ps, .EOF) && current(ps).text == "module_parameters" {
                 parse_top_level_module_parameters(ps, root);
+                continue;
+            }
+            if !check(ps, .EOF) && current(ps).text == "placeholder" {
+                parse_top_level_placeholder(ps, root);
+                continue;
+            }
+            if !check(ps, .EOF) && current(ps).text == "run" {
+                directive := parse_compiler_directive_statement(ps, hash_token);
+                if directive array_add(*root.statements, directive);
                 continue;
             }
             skip_top_level_compiler_directive(ps);
@@ -236,6 +255,22 @@ parse_top_level_items :: (ps: *Parse_State, root: *Node, stop_at_close_brace := 
         decl := parse_top_level_declaration(ps);
         if decl array_add(*root.declarations, decl);
     }
+}
+
+parse_top_level_placeholder :: (ps: *Parse_State, root: *Node) {
+    directive := expect(ps, .IDENTIFIER, "Expected 'placeholder' after '#'");
+    if directive.text != "placeholder" {
+        set_error(ps, "Expected '#placeholder'", directive.span);
+        return;
+    }
+
+    name := expect(ps, .IDENTIFIER, "Expected declaration name after '#placeholder'");
+    if name.text.count > 0 {
+        declaration := new_node(.CONST_DECL, name.span);
+        declaration.name = name.text;
+        array_add(*root.declarations, declaration);
+    }
+    match(ps, .SEMICOLON);
 }
 
 parse_top_level_module_parameters :: (ps: *Parse_State, root: *Node) {
@@ -281,7 +316,7 @@ parse_top_level_if_directive :: (ps: *Parse_State, root: *Node, hash_token: Toke
     // Jai also uses `#if value == { case ... }` as a compile-time switch.
     // Its brace contains case directives rather than declarations, so keep
     // treating that form as an opaque directive body.
-    if top_level_if_is_switch_form(ps) {
+    if compiler_if_is_switch_form(ps) {
         while !check(ps, .OPEN_BRACE) && !check(ps, .SEMICOLON) && !check(ps, .EOF) && !ps.has_error {
             advance(ps);
         }
@@ -324,7 +359,7 @@ parse_top_level_if_directive :: (ps: *Parse_State, root: *Node, hash_token: Toke
     }
 }
 
-top_level_if_is_switch_form :: (ps: *Parse_State) -> bool {
+compiler_if_is_switch_form :: (ps: *Parse_State) -> bool {
     scan := ps.index;
     while scan < ps.tokens.count {
         kind := ps.tokens[scan].kind;
@@ -1651,8 +1686,33 @@ parse_mixed_assignment_declaration :: (ps: *Parse_State) -> *Node {
     first_name := expect(ps, .IDENTIFIER, "Expected assignment name");
     node := new_node(.LOCAL_GROUP_DECL, first_name.span);
 
+    // In `created, existing=, other := call()`, identifiers marked by `=`
+    // are assignments to existing bindings; the unmarked identifiers are
+    // declarations introduced by `:=`. Retain both roles so the resolver can
+    // install the new locals and resolve the assignment targets.
+    pending_name := first_name;
     while !check(ps, .COLON_EQUAL) && !check(ps, .SEMICOLON) && !check(ps, .EOF) && !ps.has_error {
-        advance(ps);
+        assigned := match(ps, .EQUAL);
+        if assigned {
+            target := new_node(.IDENTIFIER_EXPR, pending_name.span);
+            target.name = pending_name.text;
+            array_add(*node.args, target);
+        } else {
+            local := new_node(.LOCAL_INFER_DECL, pending_name.span);
+            local.name = pending_name.text;
+            array_add(*node.declarations, local);
+        }
+
+        if !match(ps, .COMMA) break;
+        pending_name = expect(ps, .IDENTIFIER, "Expected assignment name after ','");
+    }
+
+    // The final identifier is followed directly by `:=` rather than being
+    // consumed by the loop above.
+    if check(ps, .COLON_EQUAL) {
+        local := new_node(.LOCAL_INFER_DECL, pending_name.span);
+        local.name = pending_name.text;
+        array_add(*node.declarations, local);
     }
 
     if match(ps, .COLON_EQUAL) {
@@ -1705,10 +1765,18 @@ parse_if_statement :: (ps: *Parse_State, if_token: Token) -> *Node {
     while scan < ps.tokens.count && ps.tokens[scan].kind != .EOF {
         if ps.tokens[scan].kind == .OPEN_BRACE {
             if scan > ps.index && ps.tokens[scan - 1].kind == .EQUAL_EQUAL {
-                while !check(ps, .OPEN_BRACE) && !check(ps, .EOF) && !ps.has_error {
-                    advance(ps);
-                }
+                // `if selector == { case ... }` is Jai's switch form. The
+                // equality marker terminates the selector rather than
+                // starting an ordinary binary expression. Temporarily expose
+                // it as a non-operator so the normal expression parser keeps
+                // the complete selector AST for semantic queries.
+                marker_index := scan - 1;
+                marker_kind := ps.tokens[marker_index].kind;
+                ps.tokens[marker_index].kind = .SEMICOLON;
+                node.lhs = parse_expression(ps);
+                ps.tokens[marker_index].kind = marker_kind;
 
+                expect(ps, .EQUAL_EQUAL, "Expected '==' before switch cases");
                 if match(ps, .OPEN_BRACE) {
                     node.body = parse_block_after_open(ps, previous(ps));
                     return node;
@@ -1762,7 +1830,10 @@ parse_if_statement :: (ps: *Parse_State, if_token: Token) -> *Node {
 parse_for_statement :: (ps: *Parse_State, for_token: Token) -> *Node {
     node := new_node(.FOR_STATEMENT, for_token.span);
 
-    skip_for_modifiers(ps);
+    // Preserve pointer iteration in the parsed body.  It changes the type of
+    // the implicit `it` binding from Element to *Element, so semantic queries
+    // cannot treat `for * values` as an ordinary value iterator.
+    if skip_for_modifiers(ps) node.op = .STAR;
 
     if is_for_iterator_header_ahead(ps) {
         node.name = parse_for_iterator_names(ps, node);
@@ -1787,7 +1858,8 @@ parse_for_statement :: (ps: *Parse_State, for_token: Token) -> *Node {
     return node;
 }
 
-skip_for_modifiers :: (ps: *Parse_State) {
+skip_for_modifiers :: (ps: *Parse_State) -> bool {
+    pointer_iterator := false;
     while !ps.has_error {
         if match(ps, .COLON) {
             if !check(ps, .OPEN_BRACE) && !check(ps, .IDENTIFIER) advance(ps);
@@ -1801,6 +1873,7 @@ skip_for_modifiers :: (ps: *Parse_State) {
 
         if check(ps, .STAR) && !is_pointer_iterator_start(ps) {
             advance(ps);
+            pointer_iterator = true;
             continue;
         }
 
@@ -1810,6 +1883,7 @@ skip_for_modifiers :: (ps: *Parse_State) {
 
         break;
     }
+    return pointer_iterator;
 }
 
 is_pointer_iterator_start :: (ps: *Parse_State) -> bool {
@@ -1852,6 +1926,7 @@ parse_for_iterator_names :: (ps: *Parse_State, for_node: *Node) -> string {
 
         iterator := new_node(.LOCAL_INFER_DECL, name.span);
         iterator.name = name.text;
+        if is_pointer iterator.op = .STAR;
         array_add(*for_node.params, iterator);
 
         part := name.text;
@@ -1932,6 +2007,53 @@ parse_compiler_directive_statement :: (ps: *Parse_State, hash_token: Token) -> *
     }
 
     if node.name == "if" {
+        // The switch spelling is legal inside procedures as well as at file
+        // scope: `#if value == { case ... }`.  The contents use the
+        // compiler's case grammar, not the ordinary block grammar.  Trying
+        // to parse the brace as the right operand of `==` used to leave the
+        // parser in recovery without making progress and could allocate until
+        // the programming server exhausted memory on a tiny source file.
+        if compiler_if_is_switch_form(ps) {
+            while !check(ps, .OPEN_BRACE) && !check(ps, .SEMICOLON) && !check(ps, .EOF) && !ps.has_error {
+                advance(ps);
+            }
+            if !match(ps, .OPEN_BRACE) {
+                match(ps, .SEMICOLON);
+                return node;
+            }
+
+            open := previous(ps);
+            node.body = new_node(.BLOCK, open.span);
+            while !check(ps, .CLOSE_BRACE) && !check(ps, .EOF) {
+                statement_start := ps.index;
+
+                // Case selectors belong to the compiler-switch grammar. The
+                // statements after their semicolon are ordinary Jai and must
+                // remain in the body tree so locals and references resolve.
+                if check(ps, .IDENTIFIER) && current(ps).text == "case" {
+                    advance(ps);
+                    while !check(ps, .SEMICOLON) && !check(ps, .CLOSE_BRACE) && !check(ps, .EOF) {
+                        advance(ps);
+                    }
+                    match(ps, .SEMICOLON);
+                    continue;
+                }
+
+                stmt := parse_statement(ps);
+                if stmt array_add(*node.body.statements, stmt);
+                if ps.has_error {
+                    error_node := parser_recover_pending_error(ps, statement_start);
+                    if error_node array_add(*node.body.statements, error_node);
+                } else if ps.index == statement_start {
+                    set_error(ps, "Expected compiler-switch statement", current(ps).span);
+                    error_node := parser_recover_pending_error(ps, statement_start);
+                    if error_node array_add(*node.body.statements, error_node);
+                }
+            }
+            expect(ps, .CLOSE_BRACE, "Expected '}' after compiler switch");
+            return node;
+        }
+
         node.lhs = parse_expression(ps);
         if match(ps, .THEN) {
             stmt := parse_statement(ps);

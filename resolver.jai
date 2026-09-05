@@ -54,6 +54,7 @@ Resolver_Scope :: struct {
     symbols: [..] *Resolver_Symbol;
     symbols_by_name: Table(string, *Resolver_Symbol);
     symbol_buckets: [..] *Resolver_Symbol_Bucket;
+    escaped_symbol_buckets: [..] *Resolver_Symbol_Bucket;
     symbol_bucket_by_name: Table(string, *Resolver_Symbol_Bucket);
 }
 
@@ -162,11 +163,12 @@ resolve_project_symbols_for_files :: (files: [] Resolver_Input_File, target_path
     state.result.root_scope = new_resolver_scope(*state, null);
     state.current_scope = state.result.root_scope;
 
-    // The caller's DefMap owns dependency declarations. This query builds the
-    // lexical/body resolver only for requested files, matching rust-analyzer's
-    // split between module name resolution and per-body SourceAnalyzer state.
+    // Dependency summaries populate the lexical name scope, while only target
+    // files have their bodies lowered below. This is the same split as
+    // rust-analyzer's DefMap plus per-body SourceAnalyzer: an imported name is
+    // already a semantic symbol at the use site without parsing dependency
+    // bodies or falling back to a project-wide source scan.
     for file: files {
-        if !path_is_in_resolver_list(file.path, target_paths) continue;
         if file.root == null || file.root.kind != .FILE continue;
         directory_scope := get_or_create_directory_scope(*state, resolver_directory_for_path(file.path));
 
@@ -196,6 +198,13 @@ resolve_project_symbols_for_files :: (files: [] Resolver_Input_File, target_path
         state.current_scope = file_scope;
         for declaration: file.root.declarations {
             resolve_top_level_declaration(*state, declaration);
+        }
+        for statement: file.root.statements {
+            // Top-level compiler-directive bodies (`#run { ... }`) are body
+            // scopes of the target file, just like procedure bodies. They
+            // are intentionally absent from dependency item summaries, but
+            // must be resolved when this file is demand-lowered.
+            resolve_statement(*state, statement);
         }
 
     }
@@ -296,11 +305,12 @@ add_symbol :: (state: *Resolver_State, scope: *Resolver_Scope, name: string, kin
             if existing.declaration_node == declaration_node return existing;
         }
 
-        // Only procedures form overload sets. All other repeated spellings in
-        // one lexical scope keep the first declaration, matching ordinary
-        // shadowing and duplicate-declaration recovery.
-        if kind != .FUNCTION || bucket.symbols.count == 0 || bucket.symbols[0].kind != .FUNCTION {
-            return ifx bucket.symbols.count > 0 then bucket.symbols[0] else null;
+        // Procedures form overload sets. Ordinary values may be redeclared
+        // later in the same syntactic block (notably in Jai's unbraced switch
+        // cases); references already resolved retain the old symbol, while
+        // following references must see the new declaration.
+        if kind == .FUNCTION && bucket.symbols.count > 0 && bucket.symbols[0].kind != .FUNCTION {
+            return bucket.symbols[0];
         }
     }
 
@@ -321,8 +331,11 @@ add_symbol :: (state: *Resolver_State, scope: *Resolver_Scope, name: string, kin
         bucket = New(Resolver_Symbol_Bucket);
         bucket.name = symbol.name;
         array_add(*scope.symbol_buckets, bucket);
+        resolver_scope_track_escaped_bucket(scope, bucket);
         table_add(*scope.symbol_bucket_by_name, bucket.name, bucket);
         table_add(*scope.symbols_by_name, symbol.name, symbol);
+    } else if kind != .FUNCTION {
+        table_set(*scope.symbols_by_name, symbol.name, symbol);
     }
     array_add(*bucket.symbols, symbol);
     array_add(*state.result.symbols, symbol);
@@ -354,6 +367,7 @@ resolver_scope_add_existing_symbol :: (scope: *Resolver_Scope, symbol: *Resolver
     bucket.name = symbol.name;
     array_add(*bucket.symbols, symbol);
     array_add(*scope.symbol_buckets, bucket);
+    resolver_scope_track_escaped_bucket(scope, bucket);
     table_add(*scope.symbol_bucket_by_name, bucket.name, bucket);
     array_add(*scope.symbols, symbol);
     table_add(*scope.symbols_by_name, symbol.name, symbol);
@@ -367,6 +381,7 @@ resolver_scope_add_symbol_alias :: (scope: *Resolver_Scope, alias: string, symbo
     bucket.name = alias;
     array_add(*bucket.symbols, symbol);
     array_add(*scope.symbol_buckets, bucket);
+    resolver_scope_track_escaped_bucket(scope, bucket);
     table_add(*scope.symbol_bucket_by_name, alias, bucket);
     table_add(*scope.symbols_by_name, alias, symbol);
 }
@@ -466,7 +481,7 @@ resolve_top_level_declaration :: (state: *Resolver_State, declaration: *Node) {
             resolve_struct_declaration(state, declaration);
 
         case .ENUM_DECL;
-            for child: declaration.declarations resolve_expression(state, child.rhs);
+            resolve_enum_declaration(state, declaration);
 
         case .GLOBAL_TYPED_DECL;
             resolve_type_reference(state, declaration.type_node);
@@ -478,6 +493,17 @@ resolve_top_level_declaration :: (state: *Resolver_State, declaration: *Node) {
         case .LOCAL_INFER_DECL;
             resolve_expression(state, declaration.rhs);
     }
+}
+
+resolve_enum_declaration :: (state: *Resolver_State, node: *Node) {
+    push_scope(state);
+    defer pop_scope(state);
+
+    // Enum values form their own value namespace. Declarations and aliases in
+    // the enum body can refer to one another (for example `READY :: DEVICE`),
+    // so install the complete variant set before resolving initializers.
+    for child: node.declarations add_declaration_symbol(state, child, false);
+    for child: node.declarations resolve_expression(state, child.rhs);
 }
 
 resolve_function_declaration :: (state: *Resolver_State, fn: *Node) {
@@ -508,16 +534,26 @@ resolve_struct_declaration :: (state: *Resolver_State, node: *Node) {
         resolve_expression(state, param.rhs);
     }
 
+    // A struct is an item/data scope: every nested declaration is visible to
+    // every other nested declaration, including mutually recursive
+    // procedures. Collect the complete scope before resolving any bodies,
+    // matching rust-analyzer's item-tree/DefMap phase.
     for field: node.declarations {
         if field.kind == .STRUCT_FIELD {
             add_declaration_symbol(state, field, false);
+        } else if field.kind != .COMPILER_DIRECTIVE_STATEMENT {
+            add_declaration_symbol(state, field, true);
+        }
+    }
+
+    for field: node.declarations {
+        if field.kind == .STRUCT_FIELD {
             resolve_type_reference(state, field.type_node);
             resolve_expression(state, field.lhs);
             resolve_expression(state, field.rhs);
         } else if field.kind == .COMPILER_DIRECTIVE_STATEMENT {
             resolve_statement(state, field);
         } else {
-            add_declaration_symbol(state, field, true);
             resolve_top_level_declaration(state, field);
         }
     }
@@ -557,7 +593,20 @@ resolve_statement :: (state: *Resolver_State, statement: *Node) {
             add_declaration_symbol(state, statement, false);
             resolve_function_declaration(state, statement);
 
+        case .STRUCT_DECL;
+            add_declaration_symbol(state, statement, false);
+            resolve_struct_declaration(state, statement);
+
+        case .ENUM_DECL;
+            add_declaration_symbol(state, statement, false);
+            resolve_enum_declaration(state, statement);
+
         case .LOCAL_GROUP_DECL;
+            // Mixed declaration/assignment lists retain existing assignment
+            // targets in args and newly introduced bindings in declarations.
+            // Resolve targets and the RHS in the old scope, then install the
+            // new locals, matching Jai's `new, existing= := call()` rules.
+            for target: statement.args resolve_expression(state, target);
             resolve_expression(state, statement.rhs);
             for child: statement.declarations {
                 resolve_type_reference(state, child.type_node);
@@ -814,16 +863,67 @@ find_symbol_bucket :: (scope: *Resolver_Scope, name: string) -> *Resolver_Symbol
     return null;
 }
 
+resolver_identifier_has_escape :: (name: string) -> bool {
+    for c: name if c == #char "\\" return true;
+    return false;
+}
+
+resolver_identifier_text_equal :: (a: string, b: string) -> bool {
+    ai := 0;
+    bi := 0;
+    while true {
+        while ai < a.count && a[ai] == #char "\\" {
+            ai += 1;
+            while ai < a.count && (a[ai] == #char " " || a[ai] == #char "\t" || a[ai] == #char "\r" || a[ai] == #char "\n") ai += 1;
+        }
+        while bi < b.count && b[bi] == #char "\\" {
+            bi += 1;
+            while bi < b.count && (b[bi] == #char " " || b[bi] == #char "\t" || b[bi] == #char "\r" || b[bi] == #char "\n") bi += 1;
+        }
+        if ai >= a.count || bi >= b.count return ai >= a.count && bi >= b.count;
+        if a[ai] != b[bi] return false;
+        ai += 1;
+        bi += 1;
+    }
+    return false;
+}
+
+resolver_scope_track_escaped_bucket :: (scope: *Resolver_Scope, bucket: *Resolver_Symbol_Bucket) {
+    if scope == null || bucket == null || !resolver_identifier_has_escape(bucket.name) return;
+    array_add(*scope.escaped_symbol_buckets, bucket);
+}
+
 find_symbol_bucket_in_scope :: (scope: *Resolver_Scope, name: string) -> *Resolver_Symbol_Bucket {
     if scope == null return null;
     found, bucket := table_find(*scope.symbol_bucket_by_name, name);
-    if !found return null;
-    return bucket;
+    if found return bucket;
+
+    // Identifier escapes are spelling-only in Jai.  The declaration may use
+    // the ordinary spelling while a reference inserts escaped whitespace
+    // (`field\  _name`), so an escaped lookup must also compare against the
+    // scope's ordinary buckets.  Keep exact hash lookup as the hot path; this
+    // scan only runs for the rare escaped reference.
+    if resolver_identifier_has_escape(name) {
+        escaped_reference_match: *Resolver_Symbol_Bucket;
+        for candidate: scope.symbol_buckets {
+            if candidate == null || !resolver_identifier_text_equal(candidate.name, name) continue;
+            if escaped_reference_match != null && escaped_reference_match != candidate return null;
+            escaped_reference_match = candidate;
+        }
+        if escaped_reference_match != null return escaped_reference_match;
+    }
+
+    for escaped_bucket: scope.escaped_symbol_buckets {
+        if escaped_bucket != null && resolver_identifier_text_equal(escaped_bucket.name, name) return escaped_bucket;
+    }
+    return null;
 }
 
 find_symbol_in_scope :: (scope: *Resolver_Scope, name: string) -> *Resolver_Symbol {
     bucket := find_symbol_bucket_in_scope(scope, name);
     if bucket == null || bucket.symbols.count == 0 return null;
+    found, current := table_find(*scope.symbols_by_name, bucket.name);
+    if found && current != null return current;
     return bucket.symbols[0];
 }
 
@@ -909,6 +1009,7 @@ resolver_result_deinit :: (result: *Resolver_Result) {
         array_free(scope.symbols);
         deinit(*scope.symbols_by_name);
         array_free(scope.symbol_buckets);
+        array_free(scope.escaped_symbol_buckets);
         deinit(*scope.symbol_bucket_by_name);
         free(scope);
     }
